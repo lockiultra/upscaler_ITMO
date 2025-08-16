@@ -1,13 +1,12 @@
 import logging
-from typing import Dict, Any, Callable, Optional
 from torch.utils.data import DataLoader
 
 import torch
 import torch.nn as nn
 
-from ..model.upscaler import ProteinUpscaler
-from ..loss.loss import ProteinUpscalingLoss
-from ..utils.metrics import QualityMetrics
+from upscaler.model.upscaler import ProteinUpscaler
+from upscaler.loss.loss import ProteinUpscalingLoss
+from upscaler.utils.metrics import QualityMetrics
 
 logger = logging.getLogger(__name__)
 
@@ -21,9 +20,9 @@ class TrainingPipeline:
         loss_fn: nn.Module,
         optimizer: torch.optim.Optimizer,
         device: torch.device,
-        clip_grad_norm: Optional[float] = 1.0,
-        metrics_calculator: Optional[QualityMetrics] = None,
-        scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
+        clip_grad_norm: float | None = 1.0,
+        metrics_calculator: QualityMetrics | None = None,
+        scheduler: torch.optim.lr_scheduler._LRScheduler | None = None,
     ):
         """
         Args:
@@ -44,7 +43,7 @@ class TrainingPipeline:
         self.scheduler = scheduler
         self.model.to(self.device)
 
-    def train_epoch(self, dataloader: DataLoader) -> Dict[str, float]:
+    def train_epoch(self, dataloader: DataLoader) -> dict[str, float]:
         """
         Обучает модель одну эпоху.
         
@@ -52,7 +51,7 @@ class TrainingPipeline:
             dataloader (DataLoader): Загрузчик обучающих данных.
             
         Returns:
-            Dict[str, float]: Словарь со средними значениями потерь и метрик.
+            dict[str, float]: Словарь со средними значениями потерь и метрик.
         """
         self.model.train()
         total_loss = 0.0
@@ -106,7 +105,7 @@ class TrainingPipeline:
         return avg_metrics
 
     @torch.no_grad()
-    def validate(self, dataloader: DataLoader) -> Dict[str, float]:
+    def validate(self, dataloader: DataLoader) -> dict[str, float]:
         """
         Валидирует модель.
         
@@ -114,7 +113,7 @@ class TrainingPipeline:
             dataloader (DataLoader): Загрузчик валидационных данных.
             
         Returns:
-            Dict[str, float]: Словарь со средними значениями метрик.
+            dict[str, float]: Словарь со средними значениями метрик.
         """
         self.model.eval()
         total_rmsd = 0.0

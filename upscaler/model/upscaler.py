@@ -1,8 +1,7 @@
-import torch
 import torch.nn as nn
 
-from .encoders import ProteinEncoder
-from .layers import LocalRefinementBlock, GlobalAttentionBlock, CoordinatePredictor
+from upscaler.model.encoders import ProteinEncoder
+from upscaler.model.layers import LocalRefinementBlock, GlobalAttentionBlock, CoordinatePredictor
 
 
 class MultiScaleProteinUpscaler(nn.Module):

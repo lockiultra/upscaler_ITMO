@@ -1,6 +1,4 @@
-import torch
 from torch.utils.data import Dataset, Subset
-from typing import List, Tuple, Dict, Any
 import random
 import logging
 
@@ -22,7 +20,7 @@ class ProteinFoldCrossValidation:
         self.num_folds = 5
         self._indices_by_fold = self._create_folds()
 
-    def _create_folds(self) -> List[List[int]]:
+    def _create_folds(self) -> list[list[int]]:
         """Создает индексы для фолдов."""
         total_size = len(self.dataset)
         indices = list(range(total_size))
@@ -36,7 +34,7 @@ class ProteinFoldCrossValidation:
             folds.append(indices[start:end])
         return folds
 
-    def create_folds(self, n_folds: int = 5) -> List[Tuple[Subset, Subset]]:
+    def create_folds(self, n_folds: int = 5) -> list[tuple[Subset, Subset]]:
         """
         Создает фолды для кросс-валидации.
         
@@ -44,7 +42,7 @@ class ProteinFoldCrossValidation:
             n_folds (int): Количество фолдов.
             
         Returns:
-            List[Tuple[Subset, Subset]]: Список пар (обучающий_subset, тестовый_subset).
+            list[tuple[Subset, Subset]]: Список пар (обучающий_subset, тестовый_subset).
         """
         if n_folds != self.num_folds:
             logger.warning(f"n_folds ({n_folds}) не совпадает с self.num_folds ({self.num_folds}). Используется self.num_folds.")

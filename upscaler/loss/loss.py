@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ..data.dataset import ProteinUpscalingDataset
+from upscaler.data.dataset import ProteinUpscalingDataset
 
 
 # Определяем радиусы Ван-дер-Ваальса для атомов из dataset.py

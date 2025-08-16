@@ -1,19 +1,16 @@
 import os
-from pathlib import Path
 import logging
-from datetime import datetime
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from ..config import CSV_FILE, DATA_FOLDER, DEVICE
-from ..data.dataset import ProteinUpscalingDataset, collate_batch
-from ..model.upscaler import ProteinUpscaler
-from ..loss.loss import ProteinUpscalingLoss
-from ..utils.metrics import QualityMetrics
-from .pipeline import TrainingPipeline
-from .cross_validation import ProteinFoldCrossValidation
+from upscaler.config import CSV_FILE, DATA_FOLDER, DEVICE
+from upscaler.data.dataset import ProteinUpscalingDataset, collate_batch
+from upscaler.model.upscaler import ProteinUpscaler
+from upscaler.loss.loss import ProteinUpscalingLoss
+from upscaler.utils.metrics import QualityMetrics
+from upscaler.training.pipeline import TrainingPipeline
 
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')

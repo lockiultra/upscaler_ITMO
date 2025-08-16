@@ -1,21 +1,18 @@
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Tuple
 
+import numpy as np
 from Bio.PDB import PDBParser
 from Bio.PDB.Atom import Atom
 from Bio.PDB.Residue import Residue
 from Bio.PDB.Structure import Structure
 
-import numpy as np
-import torch
-
 
 LOGGER = logging.getLogger(__name__)
 
 
-def _atom_id_in_chain(atom: Atom) -> Tuple[str, int, str]:
+def _atom_id_in_chain(atom: Atom) -> tuple[str, int, str]:
     """
     Уникальный ключ атома внутри одной цепи:
     (resname, resseq, atom.name)
@@ -27,7 +24,7 @@ def _atom_id_in_chain(atom: Atom) -> Tuple[str, int, str]:
 def align_structures(
     low_path: str,
     high_path: str,
-) -> Tuple[np.ndarray, np.ndarray, List[str], List[str]]:
+) -> tuple[np.ndarray, np.ndarray, list[str], list[str]]:
     """
     Возвращает координаты low и high, выровненные по атомам.
     Если атома нет в одной из структур – пропускаем.
@@ -36,15 +33,15 @@ def align_structures(
     -------
     low_coords : np.ndarray (N, 3)
     high_coords: np.ndarray (N, 3)
-    atom_types : List[str]        элементы (C, N, O, ...)
-    res_types  : List[str]        остатки (ALA, VAL, ...)
+    atom_types : list[str]        элементы (C, N, O, ...)
+    res_types  : list[str]        остатки (ALA, VAL, ...)
     """
     parser = PDBParser(QUIET=True)
     low_s  = parser.get_structure("low",  low_path)
     high_s = parser.get_structure("high", high_path)
 
     # словарь: ключ -> Atom
-    def _build_map(struct: Structure) -> Dict[Tuple[str, int, str], Atom]:
+    def _build_map(struct: Structure) -> dict[tuple[str, int, str], Atom]:
         return {
             _atom_id_in_chain(at): at
             for at in struct.get_atoms()

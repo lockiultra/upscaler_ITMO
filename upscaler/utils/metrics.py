@@ -1,7 +1,6 @@
 import torch
-import torch.nn.functional as F
 
-from ..data.dataset import ProteinUpscalingDataset
+from upscaler.data.dataset import ProteinUpscalingDataset
 
 
 VDW_RADII_ANGSTROM = {

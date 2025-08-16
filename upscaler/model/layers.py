@@ -1,11 +1,9 @@
-import torch
 import torch.nn as nn
 from e3nn import o3
-from e3nn.nn import Gate
 from e3nn.o3 import FullyConnectedTensorProduct, Linear
 from torch_geometric.nn import MessagePassing
 
-from .encoders import build_knn_graph
+from upscaler.model.encoders import build_knn_graph
 
 
 class SE3EquivariantLayer(MessagePassing):
