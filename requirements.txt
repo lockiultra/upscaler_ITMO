@@ -1,0 +1,13 @@
+# Основные зависимости
+torch==2.2.2
+torch_cluster==1.6.3
+torch-geometric==2.6.1
+e3nn==0.5.6
+biopython==1.85
+pandas==2.3.0
+numpy==1.26.4
+tqdm==4.67.1
+
+# Дополнительные зависимости
+scipy==1.15.3
+matplotlib==3.10.3
