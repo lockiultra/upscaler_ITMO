@@ -156,7 +156,7 @@ if __name__ == "__main__":
         data_folder=data_folder,
         checkpoint_dir=checkpoint_dir,
         num_epochs=50,
-        batch_size=4,
+        batch_size=1,
         lr=1e-4,
         device=DEVICE,
         resume_from_checkpoint=None,
