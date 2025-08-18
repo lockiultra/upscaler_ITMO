@@ -210,3 +210,6 @@ __marimo__/
 
 data/
 mini_data/
+
+
+.DS_Store
