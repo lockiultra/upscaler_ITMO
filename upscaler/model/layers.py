@@ -51,7 +51,7 @@ class SE3EquivariantLayer(MessagePassing):
 
 class LocalRefinementBlock(nn.Module):
     """Блок локальной обработки с SE(3)-эквивариантными слоями."""
-    def __init__(self, d_model=256, radius=5.0, k=8):
+    def __init__(self, d_model=128, radius=5.0, k=8):
         super().__init__()
         self.radius = radius
         self.k = k
@@ -97,7 +97,7 @@ class LocalRefinementBlock(nn.Module):
 
 class GlobalAttentionBlock(nn.Module):
     """Блок глобального внимания."""
-    def __init__(self, d_model=256, n_heads=8):
+    def __init__(self, d_model=128, n_heads=8):
         super().__init__()
         self.attention = nn.MultiheadAttention(d_model, n_heads, batch_first=True, dropout=0.1)
         self.norm = nn.LayerNorm(d_model)
@@ -117,7 +117,7 @@ class GlobalAttentionBlock(nn.Module):
 
 class CoordinatePredictor(nn.Module):
     """Предсказывает обновления координат."""
-    def __init__(self, d_model=256):
+    def __init__(self, d_model=128):
         super().__init__()
         self.predictor = nn.Sequential(
             nn.Linear(d_model, 128),

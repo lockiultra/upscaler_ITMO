@@ -47,7 +47,7 @@ class SE3PositionalEncoder(nn.Module):
     """SE(3)-инвариантный энкодер позиций.
     Использует e3nn для создания инвариантных признаков из относительных векторов.
     """
-    def __init__(self, irreps_out="128x0e", max_radius=10.0, number_of_basis=10):
+    def __init__(self, irreps_out="64x0e", max_radius=10.0, number_of_basis=10):
         super().__init__()
         self.irreps_out = o3.Irreps(irreps_out)
         self.max_radius = max_radius
@@ -108,7 +108,7 @@ class SE3PositionalEncoder(nn.Module):
 
 
 class AtomTypeEmbedder(nn.Module):
-    def __init__(self, vocab_size=len(ATOM_TYPE_MAP), irreps_out="64x0e"):
+    def __init__(self, vocab_size=len(ATOM_TYPE_MAP), irreps_out="32x0e"):
         super().__init__()
         self.vocab_size = vocab_size
         self.irreps_out = o3.Irreps(irreps_out)
@@ -124,7 +124,7 @@ class AtomTypeEmbedder(nn.Module):
         return self.embedding(atom_types)
 
 class ResidueTypeEmbedder(nn.Module):
-    def __init__(self, vocab_size=len(RESIDUE_TYPE_MAP), irreps_out="64x0e"):
+    def __init__(self, vocab_size=len(RESIDUE_TYPE_MAP), irreps_out="32x0e"):
         super().__init__()
         self.vocab_size = vocab_size
         self.irreps_out = o3.Irreps(irreps_out)
