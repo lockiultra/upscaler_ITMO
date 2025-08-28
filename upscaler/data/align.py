@@ -64,3 +64,35 @@ def align_structures(
 
     LOGGER.debug("Выравнено %d атомов", len(common_keys))
     return low_coords, high_coords, atom_types, res_types
+
+
+def kabsch_superimpose(P: np.ndarray, Q: np.ndarray):
+    """
+    Проецирует Q на P: находит R, t такие что R @ Q + t ≈ P (по методу Кабша).
+    P, Q: (N,3) numpy arrays
+    Возвращает: Q_aligned (N,3), rmsd (float), R (3,3), t (3,)
+    """
+    assert P.shape == Q.shape and P.ndim == 2 and P.shape[1] == 3
+    N = P.shape[0]
+    if N == 0:
+        raise ValueError("Empty coordinates for Kabsch.")
+
+    # центры масс
+    Pc = P.mean(axis=0)
+    Qc = Q.mean(axis=0)
+    P_centered = P - Pc
+    Q_centered = Q - Qc
+
+    # ковариация
+    C = np.dot(Q_centered.T, P_centered)
+    V, S, Wt = np.linalg.svd(C)
+    
+    d = np.sign(np.linalg.det(np.dot(V, Wt)))
+    D = np.diag([1.0, 1.0, d])
+    R = np.dot(V, np.dot(D, Wt))
+    t = Pc - R.dot(Qc)
+
+    Q_aligned = (R.dot(Q.T)).T + t
+    diff = P - Q_aligned
+    rmsd = float(np.sqrt((diff**2).sum() / N))
+    return Q_aligned, rmsd, R, t
