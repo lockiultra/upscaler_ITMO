@@ -103,17 +103,14 @@ class GlobalAttentionBlock(nn.Module):
         self.norm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(0.1)
 
-    def forward(self, node_feats):
-        """
-        Args:
-            node_feats: Tensor of shape [B, N, d_model]
-        Returns:
-            attended_feats: Tensor of shape [B, N, d_model]
-        """
-        attn_out, _ = self.attention(node_feats, node_feats, node_feats)
-        # residual и norm
+    def forward(self, node_feats, mask=None):
+        key_padding_mask = None
+        if mask is not None:
+            key_padding_mask = ~mask 
+        attn_out, _ = self.attention(node_feats, node_feats, node_feats, key_padding_mask=key_padding_mask)
         out = self.norm(node_feats + self.dropout(attn_out))
         return out
+
 
 class CoordinatePredictor(nn.Module):
     """Предсказывает обновления координат."""

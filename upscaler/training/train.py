@@ -1,52 +1,139 @@
+from __future__ import annotations
+
 import os
 import logging
+from typing import Optional
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 from upscaler.config import CSV_FILE, DATA_FOLDER, DEVICE
-from upscaler.data.dataset import ProteinUpscalingDataset, collate_batch
+from upscaler.data.dataset import (
+    ProteinUpscalingDataset,
+    collate_batch,
+)
 from upscaler.model.upscaler import ProteinUpscaler
 from upscaler.loss.loss import ProteinUpscalingLoss
 from upscaler.utils.metrics import QualityMetrics
 from upscaler.training.pipeline import TrainingPipeline
 
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
 def get_optimizer(model: nn.Module, lr: float = 1e-4) -> torch.optim.Optimizer:
-    """Создает оптимизатор."""
     return torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
 
+
 def get_scheduler(optimizer: torch.optim.Optimizer) -> torch.optim.lr_scheduler._LRScheduler:
-    """Создает планировщик learning rate."""
     return torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', patience=5, factor=0.5, verbose=True
+        optimizer, mode="min", patience=5, factor=0.5, verbose=True
     )
 
-def save_checkpoint(model: nn.Module, optimizer: torch.optim.Optimizer, epoch: int, loss: float, checkpoint_dir: str):
-    """Сохраняет чекпоинт модели."""
-    checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_epoch_{epoch}.pt")
-    torch.save({
-        'epoch': epoch,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'loss': loss,
-    }, checkpoint_path)
-    logger.info(f"Checkpoint saved to {checkpoint_path}")
 
-def load_checkpoint(model: nn.Module, optimizer: torch.optim.Optimizer, checkpoint_path: str):
-    """Загружает чекпоинт модели."""
-    checkpoint = torch.load(checkpoint_path)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    epoch = checkpoint['epoch']
-    loss = checkpoint['loss']
-    logger.info(f"Checkpoint loaded from {checkpoint_path}, epoch {epoch}, loss {loss:.4f}")
-    return epoch, loss
+def save_checkpoint(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    epoch: int,
+    metric: float,
+    checkpoint_dir: str,
+    pipeline_state: Optional[dict] = None,
+):
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_epoch_{epoch}.pt")
+    payload = {
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "metric": float(metric),
+    }
+    if pipeline_state is not None:
+        payload["pipeline_state"] = pipeline_state
+    torch.save(payload, checkpoint_path)
+    logger.info(f"Saved checkpoint to {checkpoint_path}")
+
+
+def load_checkpoint(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    checkpoint_path: str,
+    pipeline: Optional[TrainingPipeline] = None,
+):
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    model.load_state_dict(checkpoint["model_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    if pipeline is not None and "pipeline_state" in checkpoint:
+        pipeline.load_state_dict(checkpoint["pipeline_state"])
+    epoch = int(checkpoint.get("epoch", 0))
+    metric = float(checkpoint.get("metric", 0.0))
+    logger.info(f"Loaded checkpoint {checkpoint_path} (epoch {epoch}, metric {metric:.4f})")
+    return epoch, metric
+
+
+def build_dataloaders(
+    dataset: ProteinUpscalingDataset,
+    batch_size: int,
+    device: torch.device,
+    use_bucket: bool = True,
+    num_workers: int = 4,
+    pin_memory: Optional[bool] = None,
+):
+    """
+    Build train/val DataLoaders. Uses BucketBatchSampler for train to reduce padding.
+    Returns (train_loader, val_loader).
+    """
+    if pin_memory is None:
+        pin_memory = True if device.type == "cuda" else False
+
+    total = len(dataset)
+    train_size = int(0.8 * total)
+    val_size = total - train_size
+    indices = list(range(total))
+    train_indices = indices[:train_size]
+    val_indices = indices[train_size:]
+
+    train_subset = Subset(dataset, train_indices)
+    val_subset = Subset(dataset, val_indices)
+
+    if use_bucket:
+        lengths = [dataset.get_num_atoms(i) for i in train_indices]
+        pairs = list(zip(train_indices, lengths))
+        pairs.sort(key=lambda x: x[1])
+        batches = []
+        for i in range(0, len(pairs), batch_size):
+            batch = [p[0] for p in pairs[i : i + batch_size]]
+            batches.append(batch)
+        train_loader = DataLoader(
+            dataset,
+            batch_sampler=batches,
+            collate_fn=collate_batch,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+        )
+    else:
+        train_loader = DataLoader(
+            train_subset,
+            batch_size=batch_size,
+            shuffle=True,
+            collate_fn=collate_batch,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=(num_workers > 0),
+        )
+
+    val_loader = DataLoader(
+        val_subset,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=collate_batch,
+        num_workers=max(0, num_workers // 2),
+        pin_memory=pin_memory,
+        persistent_workers=(num_workers // 2 > 0),
+    )
+
+    return train_loader, val_loader, train_subset, val_subset
+
 
 def train_model(
     csv_file: str,
@@ -56,52 +143,34 @@ def train_model(
     batch_size: int = 4,
     lr: float = 1e-4,
     device: torch.device = DEVICE,
-    resume_from_checkpoint: str = None,
+    resume_from_checkpoint: Optional[str] = None,
+    use_amp: bool = True,
+    use_bucket: bool = True,
 ):
     """
-    Основной скрипт для обучения модели.
-    
-    Args:
-        csv_file (str): Путь к CSV файлу с данными.
-        data_folder (str): Путь к папке с PDB файлами.
-        checkpoint_dir (str): Путь к папке для сохранения чекпоинтов.
-        num_epochs (int): Количество эпох обучения.
-        batch_size (int): Размер батча.
-        lr (float): Начальная скорость обучения.
-        device (torch.device): Устройство для вычислений.
-        resume_from_checkpoint (str): Путь к чекпоинту для возобновления обучения.
+    High-level training loop. Uses TrainingPipeline internally.
+    Saves best model according to validation RMSD.
     """
     os.makedirs(checkpoint_dir, exist_ok=True)
-    
+
     logger.info("Loading dataset...")
     dataset = ProteinUpscalingDataset(csv_file, data_folder)
-    
-    # Разделение на train/val
-    train_size = int(0.8 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
-    
-    # Создаем загрузчики данных
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_batch)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_batch)
-    
-    # Инициализируем модель
+
+    # build loaders
+    train_loader, val_loader, train_subset, val_subset = build_dataloaders(
+        dataset, batch_size, device, use_bucket=use_bucket
+    )
+
+    # init model
     logger.info("Initializing model...")
     model = ProteinUpscaler()
-    
-    # Инициализируем функцию потерь
+    model.to(device)
+
     loss_fn = ProteinUpscalingLoss(device=device)
-    
-    # Инициализируем оптимизатор
     optimizer = get_optimizer(model, lr=lr)
-    
-    # Инициализируем планировщик LR
     scheduler = get_scheduler(optimizer)
-    
-    # Инициализируем калькулятор метрик
     metrics_calculator = QualityMetrics(device=device)
-    
-    # Инициализируем пайплайн обучения
+
     pipeline = TrainingPipeline(
         model=model,
         loss_fn=loss_fn,
@@ -110,54 +179,61 @@ def train_model(
         clip_grad_norm=1.0,
         metrics_calculator=metrics_calculator,
         scheduler=scheduler,
+        use_amp=use_amp,
     )
-    
+
     start_epoch = 0
-    if resume_from_checkpoint and os.path.exists(resume_from_checkpoint):
-        start_epoch, _ = load_checkpoint(model, optimizer, resume_from_checkpoint)
-        start_epoch += 1
-    
+    if resume_from_checkpoint:
+        if os.path.exists(resume_from_checkpoint):
+            start_epoch, _ = load_checkpoint(model, optimizer, resume_from_checkpoint, pipeline=pipeline)
+            start_epoch += 1
+        else:
+            logger.warning(f"resume_from_checkpoint path not found: {resume_from_checkpoint}")
+
     logger.info("Starting training...")
-    best_val_loss = float('inf')
+    best_val_metric = float("inf")
+
     for epoch in range(start_epoch, num_epochs):
         logger.info(f"Epoch {epoch+1}/{num_epochs}")
-        
-        # Обучение
+
         train_metrics = pipeline.train_epoch(train_loader)
-        logger.info(f"Train Metrics: {train_metrics}")
-        
-        # Валидация
+        logger.info(f"Train metrics: {train_metrics}")
+
         val_metrics = pipeline.validate(val_loader)
-        logger.info(f"Val Metrics: {val_metrics}")
-        
-        # Шаг планировщика
+        logger.info(f"Val metrics: {val_metrics}")
+
         if scheduler is not None:
-            scheduler.step(train_metrics['loss'])
-        
-        # Сохраняем лучший чекпоинт
-        if train_metrics['loss'] < best_val_loss:
-            best_val_loss = train_metrics['loss']
-            save_checkpoint(model, optimizer, epoch, train_metrics['loss'], checkpoint_dir)
-            logger.info(f"New best model saved with loss {best_val_loss:.4f}")
-        
-        # Сохраняем чекпоинт каждые 10 эпох
+            try:
+                scheduler.step(val_metrics["val_rmsd"])
+            except Exception:
+                # fallback if scheduler expects loss
+                scheduler.step(train_metrics["loss"])
+
+        # Save best by validation RMSD
+        if val_metrics["val_rmsd"] < best_val_metric:
+            best_val_metric = val_metrics["val_rmsd"]
+            pipeline_state = pipeline.state_dict()
+            save_checkpoint(model, optimizer, epoch, best_val_metric, checkpoint_dir, pipeline_state)
+            logger.info(f"New best model saved (val_rmsd={best_val_metric:.4f})")
+
+        # periodic save every 10 epochs
         if (epoch + 1) % 10 == 0:
-            save_checkpoint(model, optimizer, epoch, train_metrics['loss'], checkpoint_dir)
-    
-    logger.info("Training completed.")
+            pipeline_state = pipeline.state_dict()
+            save_checkpoint(model, optimizer, epoch, val_metrics["val_rmsd"], checkpoint_dir, pipeline_state)
+
+    logger.info("Training finished.")
+
 
 if __name__ == "__main__":
-    csv_file = CSV_FILE
-    data_folder = DATA_FOLDER
-    checkpoint_dir = "checkpoints"
-    
     train_model(
-        csv_file=csv_file,
-        data_folder=data_folder,
-        checkpoint_dir=checkpoint_dir,
+        csv_file=CSV_FILE,
+        data_folder=DATA_FOLDER,
+        checkpoint_dir="checkpoints",
         num_epochs=50,
         batch_size=1,
         lr=1e-4,
         device=DEVICE,
         resume_from_checkpoint=None,
+        use_amp=True,
+        use_bucket=True,
     )
