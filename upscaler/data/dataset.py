@@ -273,7 +273,7 @@ class BucketBatchSampler(Sampler):
             if self.shuffle:
                 random.shuffle(bucket)
             for i in range(0, len(bucket), self.batch_size):
-                yield bucket[i:i+self.batch_size]
+                yield bucket[i:i + self.batch_size]
 
     def __len__(self):
         total = 0
@@ -299,7 +299,11 @@ class CurriculumSampler(Sampler):
         def _rmsd_for_dataset_idx(i):
             actual_idx = dataset.good_pair_indices[i]
             return dataset._rmsd_by_idx.get(actual_idx, float('inf'))
-        self.sorted_by_difficulty = sorted(self._idxs, key=_rmsd_for_dataset_idx)
+        # If no RMSDs, fallback to uniform
+        if not dataset._rmsd_by_idx:
+            self.sorted_by_difficulty = list(range(len(dataset)))
+        else:
+            self.sorted_by_difficulty = sorted(self._idxs, key=_rmsd_for_dataset_idx)
 
         # schedule_fn(epoch, max_rmsd) -> threshold
         self.schedule_fn = schedule_fn or (lambda epoch, max_rmsd: max_rmsd * min(1.0, (epoch + 1) / 20.0))
@@ -309,6 +313,7 @@ class CurriculumSampler(Sampler):
 
     def get_epoch_iterator(self, epoch: int):
         max_rmsd_all = max(self.dataset._rmsd_by_idx.values()) if self.dataset._rmsd_by_idx else 0.0
+        max_rmsd_all = max_rmsd_all or 1.0 
         thr = self.schedule_fn(epoch, max_rmsd_all)
         allowed = [i for i in self.sorted_by_difficulty if self.dataset._rmsd_by_idx.get(self.dataset.good_pair_indices[i], float('inf')) <= thr]
         if not allowed:
@@ -337,6 +342,7 @@ if __name__ == '__main__':
 
     logging.basicConfig(level=logging.INFO)
     cache_file = data_folder / "good_pairs_cache.txt"
+    # cache_file = 'pairs_cache.txt'
     dataset = ProteinUpscalingDataset(csv_file, data_folder, prefilter_cache=cache_file)
     print(f"Dataset loaded successfully. Number of good pairs: {len(dataset)}")
 

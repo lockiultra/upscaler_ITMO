@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional, Dict
 
 import torch
 import torch.nn as nn
@@ -19,7 +18,7 @@ class TrainingPipeline:
         device: torch.device,
         clip_grad_norm: float | None = 1.0,
         metrics_calculator=None,
-        scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
+        scheduler: torch.optim.lr_scheduler._LRScheduler | None = None,
         use_amp: bool = True,
         log_every: int = 10,
     ):
@@ -49,7 +48,7 @@ class TrainingPipeline:
         # GradScaler for AMP (enabled only on CUDA and when requested)
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
 
-    def train_epoch(self, dataloader: DataLoader) -> Dict[str, float]:
+    def train_epoch(self, dataloader: DataLoader) -> dict[str, float]:
         """
         Train one epoch over dataloader.
         Expects dataloader to yield samples in collated dict-form produced by collate_batch:
@@ -119,6 +118,43 @@ class TrainingPipeline:
             avg_metrics = total_metrics
         avg_metrics["loss"] = avg_loss
         return avg_metrics
+
+    def train_one_batch(self, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """
+        Train on a single batch and return loss and metrics.
+        """
+        coords_bad = batch["coords_bad"].to(self.device, non_blocking=True)
+        coords_good = batch["coords_good"].to(self.device, non_blocking=True)
+        atom_types = batch["atom_types"].to(self.device, non_blocking=True)
+        residue_types = batch["residue_types"].to(self.device, non_blocking=True)
+        mask = batch.get("mask", None)
+        if mask is not None:
+            mask = mask.to(self.device, non_blocking=True)
+
+        self.optimizer.zero_grad(set_to_none=True)
+
+        with torch.cuda.amp.autocast(enabled=self.use_amp):
+            pred_coords = self.model(coords_bad, atom_types, residue_types, mask=mask) if self._model_accepts_mask() else self.model(coords_bad, atom_types, residue_types)
+            try:
+                loss, metrics = self.loss_fn(pred_coords, coords_good, atom_types, mask=mask)
+            except TypeError:
+                loss, metrics = self.loss_fn(pred_coords, coords_good, atom_types)
+
+        if self.use_amp:
+            self.scaler.scale(loss).backward()
+            if self.clip_grad_norm is not None:
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.clip_grad_norm)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            loss.backward()
+            if self.clip_grad_norm is not None:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.clip_grad_norm)
+            self.optimizer.step()
+
+        metrics['total'] = loss.detach()  # Add total loss to metrics for consistency
+        return loss.detach(), {k: v.detach() for k, v in metrics.items()}
 
     @torch.no_grad()
     def validate(self, dataloader: DataLoader) -> dict[str, float]:

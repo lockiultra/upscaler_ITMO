@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import os
 import logging
-from typing import Optional
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
 
+from upscaler.data.dataset import CurriculumSampler
 from upscaler.config import CSV_FILE, DATA_FOLDER, DEVICE
 from upscaler.data.dataset import (
     ProteinUpscalingDataset,
@@ -38,7 +38,7 @@ def save_checkpoint(
     epoch: int,
     metric: float,
     checkpoint_dir: str,
-    pipeline_state: Optional[dict] = None,
+    pipeline_state: dict | None = None,
 ):
     os.makedirs(checkpoint_dir, exist_ok=True)
     checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_epoch_{epoch}.pt")
@@ -58,7 +58,7 @@ def load_checkpoint(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
     checkpoint_path: str,
-    pipeline: Optional[TrainingPipeline] = None,
+    pipeline: TrainingPipeline | None = None,
 ):
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     model.load_state_dict(checkpoint["model_state_dict"])
@@ -77,7 +77,8 @@ def build_dataloaders(
     device: torch.device,
     use_bucket: bool = True,
     num_workers: int = 4,
-    pin_memory: Optional[bool] = None,
+    use_curriculum: bool = False,
+    pin_memory: bool | None = None,
 ):
     """
     Build train/val DataLoaders. Uses BucketBatchSampler for train to reduce padding.
@@ -96,7 +97,9 @@ def build_dataloaders(
     train_subset = Subset(dataset, train_indices)
     val_subset = Subset(dataset, val_indices)
 
-    if use_bucket:
+    if use_curriculum:
+        train_loader = None  # Will be handled per-epoch
+    elif use_bucket:
         lengths = [dataset.get_num_atoms(i) for i in train_indices]
         pairs = list(zip(train_indices, lengths))
         pairs.sort(key=lambda x: x[1])
@@ -143,9 +146,10 @@ def train_model(
     batch_size: int = 4,
     lr: float = 1e-4,
     device: torch.device = DEVICE,
-    resume_from_checkpoint: Optional[str] = None,
+    resume_from_checkpoint: str | None = None,
     use_amp: bool = True,
     use_bucket: bool = True,
+    use_curriculum: bool = False,
 ):
     """
     High-level training loop. Uses TrainingPipeline internally.
@@ -157,7 +161,7 @@ def train_model(
     dataset = ProteinUpscalingDataset(csv_file, data_folder)
 
     # build loaders
-    train_loader, val_loader, train_subset, val_subset = build_dataloaders(
+    train_loader, val_loader, _, _ = build_dataloaders(
         dataset, batch_size, device, use_bucket=use_bucket
     )
 
@@ -194,10 +198,40 @@ def train_model(
     best_val_metric = float("inf")
 
     for epoch in range(start_epoch, num_epochs):
-        logger.info(f"Epoch {epoch+1}/{num_epochs}")
+        if use_curriculum:
+            logger.info(f"Epoch {epoch+1}/{num_epochs} (Curriculum mode)")
+            curriculum_sampler = CurriculumSampler(dataset, batch_size=batch_size)
+            epoch_iterator = curriculum_sampler.get_epoch_iterator(epoch)
 
-        train_metrics = pipeline.train_epoch(train_loader)
-        logger.info(f"Train metrics: {train_metrics}")
+            total_loss = 0.0
+            total_metrics = {
+                "coord_rmsd": 0.0,
+                "lddt": 0.0,
+                "clash": 0.0,
+                "physics": 0.0,
+                "total": 0.0,
+            }
+            num_batches = 0
+            for batch_indices in epoch_iterator:
+                batch_samples = [dataset[i] for i in batch_indices]
+                batch = collate_batch(batch_samples)
+                loss, metrics = pipeline.train_one_batch(batch)
+                total_loss += float(loss.cpu().item())
+                for k in total_metrics.keys():
+                    if k in metrics:
+                        total_metrics[k] += float(metrics[k].cpu().item())
+                    else:
+                        total_metrics[k] += 0.0
+                num_batches += 1
+            avg_loss = total_loss / num_batches if num_batches else 0.0
+            avg_metrics = {k: v / num_batches if num_batches else 0.0 for k, v in total_metrics.items()}
+            avg_metrics["loss"] = avg_loss
+            train_metrics = avg_metrics
+        else:
+            logger.info(f"Epoch {epoch+1}/{num_epochs}")
+
+            train_metrics = pipeline.train_epoch(train_loader)
+            logger.info(f"Train metrics: {train_metrics}")
 
         val_metrics = pipeline.validate(val_loader)
         logger.info(f"Val metrics: {val_metrics}")
@@ -230,10 +264,11 @@ if __name__ == "__main__":
         data_folder=DATA_FOLDER,
         checkpoint_dir="checkpoints",
         num_epochs=50,
-        batch_size=1,
+        batch_size=4,
         lr=1e-4,
         device=DEVICE,
         resume_from_checkpoint=None,
         use_amp=True,
         use_bucket=True,
+        use_curriculum=True,
     )
