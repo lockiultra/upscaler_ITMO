@@ -1,6 +1,7 @@
 import torch
 
 from upscaler.data.dataset import ProteinUpscalingDataset
+from upscaler.data.align import kabsch_superimpose
 
 
 VDW_RADII_ANGSTROM = {
@@ -37,7 +38,7 @@ class QualityMetrics:
         self.vdw_radii = VDW_RADII_TENSOR.to(device)
 
     @staticmethod
-    def compute_rmsd(pred_coords, true_coords, eps=1e-8):
+    def compute_rmsd(pred_coords, true_coords, eps=1e-8, mask=None):
         """
         Вычисляет Root Mean Square Deviation (RMSD).
         
@@ -49,8 +50,16 @@ class QualityMetrics:
         Returns:
             torch.Tensor: Скалярный тензор со значением RMSD.
         """
-        diff = pred_coords - true_coords
-        return torch.sqrt(torch.mean(torch.sum(diff**2, dim=-1)) + eps)
+        rmsds = []
+        for i in range(pred_coords.shape[0]):
+            pred_i = pred_coords[i][mask[i]] if mask is not None else pred_coords[i]
+            true_i = true_coords[i][mask[i]] if mask is not None else true_coords[i]
+            if len(pred_i) > 0:
+                aligned, rmsd, _, _ = kabsch_superimpose(true_i.cpu().numpy(), pred_i.cpu().numpy())
+                rmsds.append(rmsd)
+        return torch.tensor(rmsds, device=pred_coords.device).mean() if rmsds else torch.tensor(0.0, device=pred_coords.device)
+        # diff = pred_coords - true_coords
+        # return torch.sqrt(torch.mean(torch.sum(diff**2, dim=-1)) + eps)
 
     @staticmethod
     def compute_lddt(pred_coords, true_coords, cutoff=15.0, eps=1e-8):
