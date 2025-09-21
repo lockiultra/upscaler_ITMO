@@ -213,6 +213,7 @@ def train_model(
                 "total": 0.0,
             }
             num_batches = 0
+            batch_idx = 0
             for batch_indices in epoch_iterator:
                 batch_samples = [dataset[i] for i in batch_indices]
                 batch = collate_batch(batch_samples)
@@ -224,10 +225,15 @@ def train_model(
                     else:
                         total_metrics[k] += 0.0
                 num_batches += 1
+
+                if batch_idx % 10 == 0:
+                    logger.info(f"Train Batch {batch_idx} — loss {loss.item():.4f}")
+                batch_idx += 1
             avg_loss = total_loss / num_batches if num_batches else 0.0
             avg_metrics = {k: v / num_batches if num_batches else 0.0 for k, v in total_metrics.items()}
             avg_metrics["loss"] = avg_loss
             train_metrics = avg_metrics
+            logger.info(f"Train metrics: {train_metrics}")
         else:
             logger.info(f"Epoch {epoch+1}/{num_epochs}")
 
