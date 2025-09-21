@@ -150,6 +150,7 @@ def train_model(
     use_amp: bool = True,
     use_bucket: bool = True,
     use_curriculum: bool = False,
+    prefilter_cache: str | None = 'prefilter_cache.txt',
 ):
     """
     High-level training loop. Uses TrainingPipeline internally.
@@ -158,7 +159,7 @@ def train_model(
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     logger.info("Loading dataset...")
-    dataset = ProteinUpscalingDataset(csv_file, data_folder)
+    dataset = ProteinUpscalingDataset(csv_file, data_folder, prefilter_cache=prefilter_cache)
 
     # build loaders
     train_loader, val_loader, _, _ = build_dataloaders(
@@ -167,7 +168,7 @@ def train_model(
 
     # init model
     logger.info("Initializing model...")
-    model = ProteinUpscaler()
+    model = ProteinUpscaler(num_iterations=3)
     model.to(device)
 
     loss_fn = ProteinUpscalingLoss(device=device)

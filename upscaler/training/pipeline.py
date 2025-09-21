@@ -45,7 +45,7 @@ class TrainingPipeline:
         # Ensure model on device
         self.model.to(self.device)
 
-        # GradScaler for AMP (enabled only on CUDA and when requested)
+        # GradScaler for AMP
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
 
     def train_epoch(self, dataloader: DataLoader) -> dict[str, float]:

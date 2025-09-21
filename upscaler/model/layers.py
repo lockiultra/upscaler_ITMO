@@ -8,7 +8,7 @@ from upscaler.model.encoders import build_knn_graph
 
 class SE3EquivariantLayer(MessagePassing):
     """SE(3)-эквивариантный слой на основе e3nn и MessagePassing."""
-    def __init__(self, irreps_input, irreps_output, irreps_edge_attr="0e + 1o", **kwargs):
+    def __init__(self, irreps_input='64x0e + 32x1e + 16x2e', irreps_output='64x0e + 32x1e + 16x2e', irreps_edge_attr="1x1o", **kwargs):
         kwargs.setdefault('aggr', 'add')
         super().__init__(**kwargs)
         
@@ -51,13 +51,13 @@ class SE3EquivariantLayer(MessagePassing):
 
 class LocalRefinementBlock(nn.Module):
     """Блок локальной обработки с SE(3)-эквивариантными слоями."""
-    def __init__(self, d_model=128, radius=5.0, k=8):
+    def __init__(self, irreps_model, radius=5.0, k=8):
         super().__init__()
         self.radius = radius
         self.k = k
-        self.irreps_input = o3.Irreps(f"{d_model}x0e")
+        self.irreps_input = o3.Irreps(irreps_model)
         self.irreps_output = self.irreps_input
-        self.irreps_edge_attr = o3.Irreps("1x1o") # Вектор
+        self.irreps_edge_attr = o3.Irreps("1x1o")
         
         self.equivariant_layer = SE3EquivariantLayer(
             self.irreps_input,
@@ -74,6 +74,7 @@ class LocalRefinementBlock(nn.Module):
             refined_feats: Tensor of shape [B, N, d_model] (инвариантные признаки)
         """
         batch_size, num_nodes, d_model = node_feats.shape
+        d_model = self.irreps_input.dim
         
         # Строим локальный граф
         edge_index = build_knn_graph(coords, k=self.k)
@@ -97,7 +98,7 @@ class LocalRefinementBlock(nn.Module):
 
 class GlobalAttentionBlock(nn.Module):
     """Блок глобального внимания."""
-    def __init__(self, d_model=128, n_heads=8):
+    def __init__(self, d_model=256, n_heads=8):
         super().__init__()
         self.attention = nn.MultiheadAttention(d_model, n_heads, batch_first=True, dropout=0.1)
         self.norm = nn.LayerNorm(d_model)
@@ -114,7 +115,7 @@ class GlobalAttentionBlock(nn.Module):
 
 class CoordinatePredictor(nn.Module):
     """Предсказывает обновления координат."""
-    def __init__(self, d_model=128):
+    def __init__(self, d_model=256):
         super().__init__()
         self.predictor = nn.Sequential(
             nn.Linear(d_model, 128),

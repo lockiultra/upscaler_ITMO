@@ -5,52 +5,64 @@ from upscaler.model.layers import LocalRefinementBlock, GlobalAttentionBlock, Co
 
 
 class MultiScaleProteinUpscaler(nn.Module):
-    def __init__(self):
+    def __init__(self, num_iterations=3):
         super().__init__()
         self.encoder = ProteinEncoder()
-        d_model = self.encoder.d_out # 256
+        
+        irreps_model = self.encoder.irreps_out
+        d_model = self.encoder.d_out
         
         # Многомасштабные блоки
         self.local_blocks = nn.ModuleList([
-            LocalRefinementBlock(d_model=d_model, radius=5.0, k=8),
-            LocalRefinementBlock(d_model=d_model, radius=10.0, k=16),
+            LocalRefinementBlock(irreps_model=irreps_model, radius=2.5, k=4),
+            LocalRefinementBlock(irreps_model=irreps_model, radius=5.0, k=8),
+            LocalRefinementBlock(irreps_model=irreps_model, radius=7.5, k=12),
+            LocalRefinementBlock(irreps_model=irreps_model, radius=10.0, k=16),
+            LocalRefinementBlock(irreps_model=irreps_model, radius=12.5, k=20),
         ])
         self.global_blocks = nn.ModuleList([
-            GlobalAttentionBlock(d_model=d_model),
-            GlobalAttentionBlock(d_model=d_model),
+            GlobalAttentionBlock(d_model=d_model, n_heads=8),
+            GlobalAttentionBlock(d_model=d_model, n_heads=8),
+            GlobalAttentionBlock(d_model=d_model, n_heads=8),
+            GlobalAttentionBlock(d_model=d_model, n_heads=8),
         ])
         self.coordinate_predictor = CoordinatePredictor(d_model=d_model)
 
+        self.num_iterations = num_iterations
+
     def forward(self, coords, atom_types, residue_types, mask=None):
-        node_feats = self.encoder(coords, atom_types, residue_types) # [B, N, d_model]
-
-        # применяем маску к признакам, чтобы скрыть паддинг
-        if mask is not None:
-            maskf = mask.unsqueeze(-1).to(node_feats.dtype)  # [B, N, 1]
-            node_feats = node_feats * maskf
-
-        # Локальная обработка
-        for block in self.local_blocks:
-            node_feats = block(node_feats, coords) # [B, N, d_model]
+        refined_coords = coords
+        
+        for _ in range(self.num_iterations):
+            node_feats = self.encoder(refined_coords, atom_types, residue_types)
+            
             if mask is not None:
+                maskf = mask.unsqueeze(-1).to(node_feats.dtype)
                 node_feats = node_feats * maskf
-
-        # Глобальная обработка
-        for block in self.global_blocks:
-            try:
-                node_feats = block(node_feats, mask=mask)
-            except TypeError:
-                node_feats = block(node_feats)
-
-        # Предсказание координат
-        coord_updates = self.coordinate_predictor(node_feats) # [B, N, 3]
-
-        # Наносим обновления только на валидные позиции
-        if mask is not None:
-            mask3 = mask.unsqueeze(-1).to(coord_updates.dtype)
-            coord_updates = coord_updates * mask3
-
-        refined_coords = coords + coord_updates
+            
+            residual = node_feats
+            for block in self.local_blocks:
+                node_feats = block(node_feats, refined_coords) + residual
+                if mask is not None:
+                    node_feats = node_feats * maskf
+                residual = node_feats
+            
+            residual = node_feats
+            for block in self.global_blocks:
+                try:
+                    node_feats = block(node_feats, mask=mask) + residual
+                except TypeError:
+                    node_feats = block(node_feats) + residual
+                residual = node_feats
+            
+            coord_updates = self.coordinate_predictor(node_feats)
+            
+            if mask is not None:
+                mask3 = mask.unsqueeze(-1).to(coord_updates.dtype)
+                coord_updates = coord_updates * mask3
+            
+            refined_coords = refined_coords + coord_updates
+        
         return refined_coords
 
 

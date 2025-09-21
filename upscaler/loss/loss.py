@@ -38,8 +38,8 @@ class ProteinUpscalingLoss(nn.Module):
         self.register_buffer('vdw_radii', VDW_RADII_TENSOR.to(device))
         
         # Веса для компонентов потерь
-        self.coord_weight = 1.0
-        self.lddt_weight = 0.5
+        self.coord_weight = 0.5
+        self.lddt_weight = 1.0
         self.clash_weight = 0.3
         self.physics_weight = 0.2
 

@@ -112,7 +112,7 @@ class SE3PositionalEncoder(nn.Module):
     """
     Экономная версия: строит локальный kNN-граф вместо всех пар (O(B * N * k) вместо O(B * N^2)).
     """
-    def __init__(self, irreps_out="64x0e", max_radius=10.0, number_of_basis=8, k=16):
+    def __init__(self, irreps_out="64x0e + 32x1e + 16x2e", max_radius=10.0, number_of_basis=8, k=16):
         super().__init__()
         self.irreps_out = o3.Irreps(irreps_out)
         self.max_radius = max_radius
@@ -158,7 +158,7 @@ class SE3PositionalEncoder(nn.Module):
 
 
 class AtomTypeEmbedder(nn.Module):
-    def __init__(self, vocab_size=len(ATOM_TYPE_MAP), irreps_out="32x0e"):
+    def __init__(self, vocab_size=len(ATOM_TYPE_MAP), irreps_out="32x0e + 16x1e"):
         super().__init__()
         self.vocab_size = vocab_size
         self.irreps_out = o3.Irreps(irreps_out)
@@ -174,7 +174,7 @@ class AtomTypeEmbedder(nn.Module):
         return self.embedding(atom_types)
 
 class ResidueTypeEmbedder(nn.Module):
-    def __init__(self, vocab_size=len(RESIDUE_TYPE_MAP), irreps_out="32x0e"):
+    def __init__(self, vocab_size=len(RESIDUE_TYPE_MAP), irreps_out="32x0e + 16x1e"):
         super().__init__()
         self.vocab_size = vocab_size
         self.irreps_out = o3.Irreps(irreps_out)
@@ -192,10 +192,11 @@ class ResidueTypeEmbedder(nn.Module):
 class ProteinEncoder(nn.Module):
     def __init__(self):
         super().__init__()
-        self.position_encoder = SE3PositionalEncoder(irreps_out="128x0e")
-        self.atom_embedder = AtomTypeEmbedder(irreps_out="64x0e")
-        self.residue_embedder = ResidueTypeEmbedder(irreps_out="64x0e")
-        self.d_out = 128 + 64 + 64
+        self.position_encoder = SE3PositionalEncoder(irreps_out="64x0e + 32x1e + 16x2e")
+        self.atom_embedder = AtomTypeEmbedder(irreps_out="64x0e + 32x1e")
+        self.residue_embedder = ResidueTypeEmbedder(irreps_out="64x0e + 32x1e")
+        self.d_out = self.position_encoder.irreps_out.dim + self.atom_embedder.irreps_out.dim + self.residue_embedder.irreps_out.dim
+        self.irreps_out = self.position_encoder.irreps_out + self.atom_embedder.irreps_out + self.residue_embedder.irreps_out
 
     def forward(self, coords, atom_types, residue_types):
         """
