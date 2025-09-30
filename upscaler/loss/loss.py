@@ -39,9 +39,9 @@ class ProteinUpscalingLoss(nn.Module):
         
         # Веса для компонентов потерь
         self.coord_weight = 0.5
-        self.lddt_weight = 1.0
-        self.clash_weight = 0.3
-        self.physics_weight = 0.2
+        self.lddt_weight = 2.0
+        self.clash_weight = 0.05
+        self.physics_weight = 0.3
 
     def forward(self, pred_coords, true_coords, atom_types):
         """
