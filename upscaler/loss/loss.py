@@ -141,8 +141,14 @@ class ProteinUpscalingLoss(nn.Module):
         # Подсчитываем количество столкновений
         num_clashes = torch.sum(clashes.float(), dim=(-1, -2)) / 2.0
         
-        # Штраф - среднее количество столкновений на пример в батче
-        return torch.mean(num_clashes)
+        num_atoms = coords.shape[-2]
+        if num_atoms > 0:
+            normalized_clashes = num_clashes / num_atoms
+        else:
+            normalized_clashes = torch.zeros_like(num_clashes)
+        
+        # Возвращаем среднее количество столкновений на пример в батче
+        return torch.mean(normalized_clashes)
 
     def compute_physics_constraints(self, coords, atom_types, backbone_elements={'C', 'N', 'O'}, eps=1e-8):
         """
