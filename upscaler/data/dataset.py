@@ -203,6 +203,10 @@ class ProteinUpscalingDataset(Dataset):
             logger.error(f"Alignment failed for pair {actual_idx} ({bad_row['pdb']}, {good_row['pdb']}): {e}")
             raise e
 
+        if low_coords.shape[0] > 0:
+            aligned_high_coords, _, _, _ = kabsch_superimpose(low_coords, high_coords)
+            high_coords = aligned_high_coords
+
         N = low_coords.shape[0]
         # ограничение по количеству атомов: случайная подвыборка если очень много
         if self.max_atoms is not None and N > self.max_atoms:
