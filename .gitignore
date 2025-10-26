@@ -212,6 +212,7 @@ __marimo__/
 data/
 mini_data/
 checkpoints/
+*.txt
 
 
 .DS_Store
