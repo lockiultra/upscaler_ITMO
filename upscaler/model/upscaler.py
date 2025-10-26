@@ -1,7 +1,7 @@
 import torch.nn as nn
 
 from upscaler.model.encoders import ProteinEncoder
-from upscaler.model.layers import LocalRefinementBlock, GlobalAttentionBlock, CoordinatePredictor
+from upscaler.model.layers import LocalRefinementBlock, GlobalAttentionBlock, CoordinatePredictor, ManifoldUpdateHead
 
 
 class MultiScaleProteinUpscaler(nn.Module):
@@ -12,7 +12,6 @@ class MultiScaleProteinUpscaler(nn.Module):
         irreps_model = self.encoder.irreps_out
         d_model = self.encoder.d_out
         
-        # Многомасштабные блоки
         self.local_blocks = nn.ModuleList([
             LocalRefinementBlock(irreps_model=irreps_model, radius=2.5, k=4),
             LocalRefinementBlock(irreps_model=irreps_model, radius=5.0, k=8),
@@ -26,7 +25,8 @@ class MultiScaleProteinUpscaler(nn.Module):
             GlobalAttentionBlock(d_model=d_model, n_heads=8),
             GlobalAttentionBlock(d_model=d_model, n_heads=8),
         ])
-        self.coordinate_predictor = CoordinatePredictor(d_model=d_model)
+        # self.coordinate_predictor = CoordinatePredictor(d_model=d_model)
+        self.update_head = ManifoldUpdateHead(d_model=d_model)
 
         self.num_iterations = num_iterations
 
@@ -55,13 +55,15 @@ class MultiScaleProteinUpscaler(nn.Module):
                     node_feats = block(node_feats) + residual
                 residual = node_feats
             
-            coord_updates = self.coordinate_predictor(node_feats)
+            # coord_updates = self.coordinate_predictor(node_feats)
             
-            if mask is not None:
-                mask3 = mask.unsqueeze(-1).to(coord_updates.dtype)
-                coord_updates = coord_updates * mask3
+            # if mask is not None:
+            #     mask3 = mask.unsqueeze(-1).to(coord_updates.dtype)
+            #     coord_updates = coord_updates * mask3
             
-            refined_coords = refined_coords + coord_updates
+            # refined_coords = refined_coords + coord_updates
+
+            refined_coords = self.update_head(node_feats, refined_coords, mask=mask)
         
         return refined_coords
 

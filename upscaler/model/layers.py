@@ -1,7 +1,11 @@
+import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from e3nn import o3
 from e3nn.o3 import FullyConnectedTensorProduct, Linear
 from torch_geometric.nn import MessagePassing
+from pytorch3d.transforms import quaternion_apply
+from pytorch3d.transforms.rotation_conversions import axis_angle_to_quaternion
 
 from upscaler.model.encoders import build_knn_graph
 
@@ -133,3 +137,68 @@ class CoordinatePredictor(nn.Module):
             coord_updates: Tensor of shape [..., 3]
         """
         return self.predictor(node_feats)
+
+
+class GeometricUpdateHead(nn.Module):
+    def __init__(self, d_model: int, num_modules: int = 8, max_translation: float = 3.0, max_rotation_angle: float = torch.pi):
+        super().__init__()
+        self.num_modules = num_modules
+        self.d_model = d_model
+        self.max_translation = max_translation
+        self.max_rotation_angle = max_rotation_angle
+        self.param_predictor = nn.Linear(d_model, num_modules * 8)
+
+    def forward(self, node_feats: torch.Tensor, coords: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+        B, N, _ = coords.shape
+
+        input_dtype = coords.dtype
+        
+        params = self.param_predictor(node_feats)
+        params = params.view(B, N, self.num_modules, 8)
+        
+        anchor_logits, select_logits, rot_axis, trans_vectors = torch.split(
+            params, [1, 1, 3, 3], dim=-1
+        )
+        
+        anchor_weights = F.softmax(anchor_logits, dim=1)
+        select_probs = torch.sigmoid(select_logits)
+
+        rot_axis_float32 = rot_axis.float()
+        rot_angles = torch.norm(rot_axis_float32, dim=-1, keepdim=True)
+        rot_axis_norm = F.normalize(rot_axis_float32, dim=-1)
+        rot_angles = torch.tanh(rot_angles) * self.max_rotation_angle
+        
+        quaternions = axis_angle_to_quaternion(rot_axis_norm * rot_angles)
+        
+        trans_vectors = torch.tanh(trans_vectors.float()) * self.max_translation
+
+        current_coords = coords.clone()
+        
+        for i in range(self.num_modules):
+            q_i = quaternions[:, :, i, :]
+            t_i = trans_vectors[:, :, i, :]
+            anchor_w_i = anchor_weights[:, :, i].float()
+            select_p_i = select_probs[:, :, i].float()
+
+            current_coords_float32 = current_coords.float()
+
+            anchor_point = torch.sum(current_coords_float32 * anchor_w_i, dim=1, keepdim=True)
+            
+            sum_select_probs = select_p_i.sum(dim=1, keepdim=True).clamp(min=1e-8)
+            q_group = torch.sum(q_i * select_p_i, dim=1, keepdim=True) / sum_select_probs
+            t_group = torch.sum(t_i * select_p_i, dim=1, keepdim=True) / sum_select_probs
+            
+            q_group = F.normalize(q_group, p=2, dim=-1)
+
+            centered_coords = current_coords_float32 - anchor_point
+            rotated_coords = quaternion_apply(q_group, centered_coords)
+            moved_coords = rotated_coords + anchor_point + t_group
+            
+            updated_coords_float32 = torch.lerp(current_coords_float32, moved_coords, select_p_i)
+            
+            current_coords = updated_coords_float32.to(input_dtype)
+
+            if mask is not None:
+                current_coords = current_coords * mask.unsqueeze(-1)
+
+        return current_coords
