@@ -45,7 +45,7 @@ def align_structures(
         return {
             _atom_id_in_chain(at): at
             for at in struct.get_atoms()
-            if at.get_parent().get_id()[0] == " "  # ATOM, не HETATM
+            if at.get_parent().get_id()[0] == " "
         }
 
     low_map  = _build_map(low_s)
@@ -59,12 +59,15 @@ def align_structures(
 
     low_coords  = np.stack([low_map[k].coord  for k in common_keys], dtype=np.float32)
     high_coords = np.stack([high_map[k].coord for k in common_keys], dtype=np.float32)
-    atom_types  = [low_map[k].element.strip().upper() for k in common_keys]
-    res_types   = [low_map[k].get_parent().resname.strip() for k in common_keys]
-
+    atom_elements = [low_map[k].element.strip().upper() for k in common_keys]
+    atom_names = [k[2].strip().upper() for k in common_keys]
+    res_names = [k[0].strip() for k in common_keys]
+    res_seqs = [k[1] for k in common_keys]
+    
     LOGGER.debug("Выравнено %d атомов", len(common_keys))
-    return low_coords, high_coords, atom_types, res_types
 
+    return low_coords, high_coords, atom_elements, atom_names, res_names, res_seqs
+    
 
 def kabsch_superimpose(P: np.ndarray, Q: np.ndarray):
     """

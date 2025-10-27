@@ -2,7 +2,6 @@ from __future__ import annotations
 import os
 import logging
 from pathlib import Path
-from typing import Dict, List, Tuple
 
 import math
 import random
@@ -15,6 +14,7 @@ from torch.utils.data import Dataset, Sampler
 from tqdm import tqdm
 
 from upscaler.data.align import align_structures, kabsch_superimpose
+from upscaler.model.geometric import frames_from_bb_coords
 
 
 logger = logging.getLogger(__name__)
@@ -22,6 +22,41 @@ logger = logging.getLogger(__name__)
 
 BATCH_SIZE = 4
 PAD_TOKEN = 0
+
+
+def _get_residue_data(coords, atom_names, res_names, res_seqs):
+    residues = {}
+    last_res_key = None
+    for i in range(len(atom_names)):
+        res_key = (res_names[i], res_seqs[i])
+        if res_key != last_res_key:
+            res_id = len(residues)
+            residues[res_id] = {'atoms': {}, 'indices': []}
+            last_res_key = res_key
+        residues[res_id]['atoms'][atom_names[i]] = coords[i]
+        residues[res_id]['indices'].append(i)
+
+    bb_coords_list = []
+    res_map = torch.full((len(coords),), -1, dtype=torch.long)
+    
+    new_res_idx = 0
+    for res_id in sorted(residues.keys()):
+        res = residues[res_id]
+        if 'N' in res['atoms'] and 'CA' in res['atoms'] and 'C' in res['atoms']:
+            n_coord = res['atoms']['N']
+            ca_coord = res['atoms']['CA']
+            c_coord = res['atoms']['C']
+            bb_coords_list.append(np.stack([n_coord, ca_coord, c_coord]))
+            
+            for atom_original_index in res['indices']:
+                res_map[atom_original_index] = new_res_idx
+            new_res_idx += 1
+
+    if not bb_coords_list:
+        return None, None
+
+    final_bb_coords = torch.from_numpy(np.stack(bb_coords_list, axis=0)).float()
+    return final_bb_coords, res_map
 
 
 class ProteinUpscalingDataset(Dataset):
@@ -48,6 +83,9 @@ class ProteinUpscalingDataset(Dataset):
              'FE', 'ZN', 'MG', 'CA', 'MN', 'CU', 'NI', 'CO',
              'CL', 'BR', 'I', 'F']
         )
+        self.atom_name_map = self._build_map(
+            ['N', 'CA', 'C', 'O', 'CB', 'CG', 'CG1', 'CG2', 'CD', 'CD1', 'CD2', 'CE', 'CE1', 'CE2', 'CE3', 'CZ', 'CZ2', 'CZ3', 'CH2', 'ND1', 'ND2', 'NE', 'NE1', 'NE2', 'NH1', 'NH2', 'NZ', 'OD1', 'OD2', 'OE1', 'OE2', 'OG', 'OG1', 'OH', 'SD', 'SE', 'SG']
+        )
         self.residue_type_map = self._build_map(
             ['ALA', 'ARG', 'ASN', 'ASP', 'CYS', 'GLN', 'GLU', 'GLY', 'HIS', 'ILE',
              'LEU', 'LYS', 'MET', 'PHE', 'PRO', 'SER', 'THR', 'TRP', 'TYR', 'VAL']
@@ -59,16 +97,15 @@ class ProteinUpscalingDataset(Dataset):
         self.prefilter_cache = Path(prefilter_cache) if prefilter_cache else None
         self.max_atoms = max_atoms
 
-        # caches filled by _load_or_create_good_indices
-        self.good_pair_indices: List[int] = []
-        self._lengths_by_idx: Dict[int, int] = {}
-        self._rmsd_by_idx: Dict[int, float] = {}
+        self.good_pair_indices: list[int] = []
+        self._lengths_by_idx: dict[int, int] = {}
+        self._rmsd_by_idx: dict[int, float] = {}
 
         self.good_pair_indices = self._load_or_create_good_indices()
         logger.info(f"Dataset initialized with {len(self.good_pair_indices)} good pairs out of {len(self.all_pairs)} total pairs.")
 
     @staticmethod
-    def _build_map(items: List[str]) -> Dict[str, int]:
+    def _build_map(items: list[str]) -> dict[str, int]:
         return {'PAD': PAD_TOKEN, **{k: idx + 1 for idx, k in enumerate(items)}}
 
     def _create_pairs(
@@ -76,7 +113,7 @@ class ProteinUpscalingDataset(Dataset):
         grouped,
         resolution_good: float,
         resolution_bad: float,
-    ) -> List[Tuple[pd.Series, pd.Series]]:
+    ) -> list[tuple[pd.Series, pd.Series]]:
         pairs = []
         for _, group in grouped:
             good = group[group['resolution'] < resolution_good]
@@ -103,7 +140,8 @@ class ProteinUpscalingDataset(Dataset):
             good_row, bad_row = self.all_pairs[idx]
             good_path = self._find_structure_file(good_row['pdb'])
             bad_path = self._find_structure_file(bad_row['pdb'])
-            low_coords, high_coords, atom_strs, res_strs = align_structures(str(bad_path), str(good_path))
+            # low_coords, high_coords, atom_elements, atom_names, res_names, res_seqs = align_structures(str(bad_path), str(good_path))
+            low_coords, high_coords, _, _, _, _ = align_structures(str(bad_path), str(good_path))
             if low_coords.shape[0] == 0:
                 return False, 0, float('inf')
             # Вычисляем RMSD после Kabsch (superimpose high -> low)
@@ -116,7 +154,7 @@ class ProteinUpscalingDataset(Dataset):
             logger.warning(f"Unexpected error checking pair {idx}: {e}")
             return False, 0, float('inf')
 
-    def _load_or_create_good_indices(self) -> List[int]:
+    def _load_or_create_good_indices(self) -> list[int]:
         """Загружает индексы хороших пар из кэша или создаёт их.
 
         Кеш в файле хранит строки вида: idx,length,rmsd
@@ -153,7 +191,7 @@ class ProteinUpscalingDataset(Dataset):
                 logger.error(f"Failed to load cache, regenerating: {e}")
 
         logger.info("Generating list of good pair indices...")
-        good_indices: List[int] = []
+        good_indices: list[int] = []
         total_pairs = len(self.all_pairs)
 
         for i in tqdm(range(total_pairs)):
@@ -184,7 +222,7 @@ class ProteinUpscalingDataset(Dataset):
         actual_idx = self.good_pair_indices[dataset_index]
         return int(self._lengths_by_idx.get(actual_idx, 0))
 
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         actual_idx = self.good_pair_indices[idx]
         good_row, bad_row = self.all_pairs[actual_idx]
 
@@ -196,9 +234,7 @@ class ProteinUpscalingDataset(Dataset):
             raise e
 
         try:
-            low_coords, high_coords, atom_strs, res_strs = align_structures(
-                str(bad_path), str(good_path)
-            )
+            low_coords, high_coords, atom_elements, atom_names, res_names, res_seqs = align_structures(str(bad_path), str(good_path))
         except ValueError as e:
             logger.error(f"Alignment failed for pair {actual_idx} ({bad_row['pdb']}, {good_row['pdb']}): {e}")
             raise e
@@ -207,54 +243,49 @@ class ProteinUpscalingDataset(Dataset):
             aligned_high_coords, _, _, _ = kabsch_superimpose(low_coords, high_coords)
             high_coords = aligned_high_coords
 
-        N = low_coords.shape[0]
-        # ограничение по количеству атомов: случайная подвыборка если очень много
-        if self.max_atoms is not None and N > self.max_atoms:
-            keep = np.random.choice(N, size=self.max_atoms, replace=False)
-            keep.sort()
-            low_coords = low_coords[keep]
-            high_coords = high_coords[keep]
-            atom_strs = [atom_strs[i] for i in keep]
-            res_strs = [res_strs[i] for i in keep]
-            N = self.max_atoms
+        bb_coords_bad, res_map_bad = _get_residue_data(low_coords, atom_names, res_names, res_seqs)
+        bb_coords_good, res_map_good = _get_residue_data(high_coords, atom_names, res_names, res_seqs)
 
-        atom_ids = [self.atom_type_map.get(a, 0) for a in atom_strs]
-        res_ids  = [self.residue_type_map.get(r, 0) for r in res_strs]
+        if bb_coords_bad is None or bb_coords_good is None:
+             return self.__getitem__((idx + 1) % len(self))
+
+        rots_bad, trans_bad = frames_from_bb_coords(bb_coords_bad[:,0], bb_coords_bad[:,1], bb_coords_bad[:,2])
+        rots_good, trans_good = frames_from_bb_coords(bb_coords_good[:,0], bb_coords_good[:,1], bb_coords_good[:,2])
+
+        atom_ids = [self.atom_type_map.get(a, 0) for a in atom_elements]
+        res_ids  = [self.residue_type_map.get(r, 0) for r in res_names]
+        atom_name_ids = [self.atom_name_map.get(name, 0) for name in atom_names]
 
         return {
-            "coords_bad":   torch.from_numpy(low_coords).float(),
-            "coords_good":  torch.from_numpy(high_coords).float(),
-            "atom_types":   torch.tensor(atom_ids, dtype=torch.long),
+            "coords_bad": torch.from_numpy(low_coords).float(),
+            "coords_good": torch.from_numpy(high_coords).float(),
+            "rots_bad": rots_bad,
+            "trans_bad": trans_bad,
+            "rots_good": rots_good,
+            "trans_good": trans_good,
+            "res_map": res_map_bad,
+            "atom_names": torch.tensor(atom_name_ids, dtype=torch.long), # Add this line
+            "atom_types": torch.tensor(atom_ids, dtype=torch.long),
             "residue_types": torch.tensor(res_ids, dtype=torch.long),
-            "length": torch.tensor(N, dtype=torch.long),
+            "length": torch.tensor(low_coords.shape[0], dtype=torch.long),
         }
 
 
 def collate_batch(batch):
-    """Pad variable-length samples to the longest in the batch and produce mask/lengths."""
-    coords_bad_list  = [b['coords_bad'] for b in batch]
-    coords_good_list = [b['coords_good'] for b in batch]
-    atom_list = [b['atom_types'] for b in batch]
-    res_list = [b['residue_types'] for b in batch]
-    lengths = torch.tensor([int(b.get('length', t.shape[0])) for b, t in zip(batch, coords_bad_list)], dtype=torch.long)
-
-    coords_bad = pad_sequence(coords_bad_list, batch_first=True)   # [B, Lmax, 3]
-    coords_good = pad_sequence(coords_good_list, batch_first=True) # [B, Lmax, 3]
-    atom_types = pad_sequence(atom_list, batch_first=True, padding_value=0)
-    residue_types = pad_sequence(res_list, batch_first=True, padding_value=0)
-
-    max_len = coords_bad.shape[1]
-    arange = torch.arange(max_len).unsqueeze(0)  # [1, Lmax]
-    mask = (arange < lengths.unsqueeze(1))  # [B, Lmax] bool
-
-    return {
-        'coords_bad': coords_bad,
-        'coords_good': coords_good,
-        'atom_types': atom_types,
-        'residue_types': residue_types,
-        'lengths': lengths,
-        'mask': mask,
-    }
+    keys = batch[0].keys()
+    out = {k: pad_sequence([b[k] for b in batch], batch_first=True) for k in keys if k not in ['length', 'mask']}
+    
+    out['lengths'] = torch.tensor([b['length'] for b in batch], dtype=torch.long)
+    max_len = out['coords_bad'].shape[1]
+    arange = torch.arange(max_len).unsqueeze(0)
+    out['mask'] = (arange < out['lengths'].unsqueeze(1))
+    
+    max_res_len = out['rots_bad'].shape[1]
+    res_lengths = torch.tensor([b['rots_bad'].shape[0] for b in batch], dtype=torch.long)
+    res_arange = torch.arange(max_res_len).unsqueeze(0)
+    out['res_mask'] = (res_arange < res_lengths.unsqueeze(1))
+    
+    return out
 
 
 # ----------------- BucketBatchSampler -----------------
@@ -329,35 +360,3 @@ class CurriculumSampler(Sampler):
 
     def __len__(self):
         return math.ceil(len(self.sorted_by_difficulty) / self.batch_size)
-
-
-# ----------------- main (debug) -----------------
-if __name__ == '__main__':
-    from upscaler.config import CSV_FILE, DATA_FOLDER
-    csv_file = Path(CSV_FILE)
-    data_folder = Path(DATA_FOLDER)
-
-    if not csv_file.exists():
-        print(f"CSV file not found: {csv_file}")
-        raise SystemExit(1)
-    if not data_folder.exists():
-        print(f"Data folder not found: {data_folder}")
-        raise SystemExit(1)
-
-    logging.basicConfig(level=logging.INFO)
-    cache_file = data_folder / "good_pairs_cache.txt"
-    # cache_file = 'pairs_cache.txt'
-    dataset = ProteinUpscalingDataset(csv_file, data_folder, prefilter_cache=cache_file)
-    print(f"Dataset loaded successfully. Number of good pairs: {len(dataset)}")
-
-    if len(dataset) == 0:
-        print("Dataset is empty. Check your CSV file and data folder.")
-        raise SystemExit(1)
-
-    sampler = BucketBatchSampler(dataset, batch_size=BATCH_SIZE, num_buckets=20)
-    loader = torch.utils.data.DataLoader(dataset, batch_sampler=list(sampler), collate_fn=collate_batch)
-    for batch in loader:
-        print("First batch shapes:")
-        for k, v in batch.items():
-            print(f"  {k}: {v.shape}")
-        break

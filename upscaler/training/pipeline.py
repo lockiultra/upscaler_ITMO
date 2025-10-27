@@ -6,6 +6,8 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
+from upscaler.model.geometric import frames_from_bb_coords
+
 logger = logging.getLogger(__name__)
 
 
@@ -48,6 +50,37 @@ class TrainingPipeline:
         # GradScaler for AMP
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
 
+    def compute_frames(self, coords, atom_names, res_map, atom_name_map):
+        B, N, _ = coords.shape
+        max_res = res_map.max(dim=1).values.max().item() + 1 if N > 0 else 0
+        bb_coords = torch.zeros(B, max_res, 3, 3, dtype=coords.dtype, device=coords.device)
+        res_mask = torch.zeros(B, max_res, dtype=torch.bool, device=coords.device)
+         
+        for b in range(B):
+            for r in range(max_res):
+                res_mask_b = (res_map[b] == r)
+                if not res_mask_b.any():
+                    continue
+                res_coords = coords[b][res_mask_b]
+                res_atom_names = atom_names[b][res_mask_b]
+                 
+                n_mask = (res_atom_names == atom_name_map.get('N', 0))
+                ca_mask = (res_atom_names == atom_name_map.get('CA', 0))
+                c_mask = (res_atom_names == atom_name_map.get('C', 0))
+                 
+                if n_mask.sum() > 0 and ca_mask.sum() > 0 and c_mask.sum() > 0:
+                    bb_coords[b, r, 0] = res_coords[n_mask][0]  # Берем первый (обычно один)
+                    bb_coords[b, r, 1] = res_coords[ca_mask][0]
+                    bb_coords[b, r, 2] = res_coords[c_mask][0]
+                    res_mask[b, r] = True
+         
+        # Усекаем по res_mask, но для простоты оставляем full и используем res_mask
+        n_coords = bb_coords[:, :, 0]
+        ca_coords = bb_coords[:, :, 1]
+        c_coords = bb_coords[:, :, 2]
+        rots, trans = frames_from_bb_coords(n_coords, ca_coords, c_coords)
+        return rots, trans, res_mask
+
     def train_epoch(self, dataloader: DataLoader) -> dict[str, float]:
         """
         Train one epoch over dataloader.
@@ -71,6 +104,8 @@ class TrainingPipeline:
             coords_good = batch["coords_good"].to(self.device, non_blocking=True)
             atom_types = batch["atom_types"].to(self.device, non_blocking=True)
             residue_types = batch["residue_types"].to(self.device, non_blocking=True)
+            atom_names = batch["atom_names"].to(self.device, non_blocking=True)
+            res_map = batch["res_map"].to(self.device, non_blocking=True)
             mask = batch.get("mask", None)
             if mask is not None:
                 mask = mask.to(self.device, non_blocking=True)
@@ -78,11 +113,37 @@ class TrainingPipeline:
             self.optimizer.zero_grad(set_to_none=True)
 
             with torch.cuda.amp.autocast(enabled=self.use_amp):
-                pred_coords = self.model(coords_bad, atom_types, residue_types, mask=mask) if self._model_accepts_mask() else self.model(coords_bad, atom_types, residue_types)
-                try:
-                    loss, metrics = self.loss_fn(pred_coords, coords_good, atom_types, mask=mask)
-                except TypeError:
-                    loss, metrics = self.loss_fn(pred_coords, coords_good, atom_types)
+                # pred_coords = self.model(coords_bad, atom_types, residue_types, mask=mask) if self._model_accepts_mask() else self.model(coords_bad, atom_types, residue_types)
+                pred_data = self.model(batch)
+                pred_coords = pred_data['coords']
+                # Вычисляем фреймы для предсказанных coords
+                from upscaler.data.dataset import ProteinUpscalingDataset
+                atom_name_map = ProteinUpscalingDataset._build_map(
+                    ['N', 'CA', 'C', 'O', 'CB', 'CG', 'CG1', 'CG2', 'CD', 'CD1', 'CD2', 'CE', 'CE1', 'CE2', 'CE3', 'CZ', 'CZ2', 'CZ3', 'CH2', 'ND1', 'ND2', 'NE', 'NE1', 'NE2', 'NH1', 'NH2', 'NZ', 'OD1', 'OD2', 'OE1', 'OE2', 'OG', 'OG1', 'OH', 'SD', 'SE', 'SG']
+                )
+                pred_rots, pred_trans, pred_res_mask = self.compute_frames(pred_coords, atom_names, res_map, atom_name_map)
+
+                # pred_data = {
+                #     'rots': pred_rots,
+                #     'trans': pred_trans,
+                #     'coords': pred_coords,
+                #     'res_mask': pred_res_mask,
+                #     'mask': mask,
+                # }
+                # true_data = {
+                #     'rots': batch["rots_good"].to(self.device, non_blocking=True),
+                #     'trans': batch["trans_good"].to(self.device, non_blocking=True),
+                #     'coords': coords_good,
+                #     'atom_types': atom_types,
+                # }
+                # loss, metrics = self.loss_fn(pred_data, true_data)
+            true_data = {
+                'rots': batch["rots_good"].to(self.device, non_blocking=True),
+                'trans': batch["trans_good"].to(self.device, non_blocking=True),
+                'coords': coords_good,
+                'atom_types': atom_types,
+            }
+            loss, metrics = self.loss_fn(pred_data, true_data)                
 
             if self.use_amp:
                 self.scaler.scale(loss).backward()
@@ -127,6 +188,8 @@ class TrainingPipeline:
         coords_good = batch["coords_good"].to(self.device, non_blocking=True)
         atom_types = batch["atom_types"].to(self.device, non_blocking=True)
         residue_types = batch["residue_types"].to(self.device, non_blocking=True)
+        atom_names = batch["atom_names"].to(self.device, non_blocking=True)
+        res_map = batch["res_map"].to(self.device, non_blocking=True)
         mask = batch.get("mask", None)
         if mask is not None:
             mask = mask.to(self.device, non_blocking=True)
@@ -134,11 +197,37 @@ class TrainingPipeline:
         self.optimizer.zero_grad(set_to_none=True)
 
         with torch.cuda.amp.autocast(enabled=self.use_amp):
-            pred_coords = self.model(coords_bad, atom_types, residue_types, mask=mask) if self._model_accepts_mask() else self.model(coords_bad, atom_types, residue_types)
-            try:
-                loss, metrics = self.loss_fn(pred_coords, coords_good, atom_types, mask=mask)
-            except TypeError:
-                loss, metrics = self.loss_fn(pred_coords, coords_good, atom_types)
+            # pred_coords = self.model(coords_bad, atom_types, residue_types, mask=mask) if self._model_accepts_mask() else self.model(coords_bad, atom_types, residue_types)
+            pred_data = self.model(batch)
+            pred_coords = pred_data['coords']
+            # Вычисляем фреймы для предсказанных coords
+            from upscaler.data.dataset import ProteinUpscalingDataset
+            atom_name_map = ProteinUpscalingDataset._build_map(
+                ['N', 'CA', 'C', 'O', 'CB', 'CG', 'CG1', 'CG2', 'CD', 'CD1', 'CD2', 'CE', 'CE1', 'CE2', 'CE3', 'CZ', 'CZ2', 'CZ3', 'CH2', 'ND1', 'ND2', 'NE', 'NE1', 'NE2', 'NH1', 'NH2', 'NZ', 'OD1', 'OD2', 'OE1', 'OE2', 'OG', 'OG1', 'OH', 'SD', 'SE', 'SG']
+            )
+            pred_rots, pred_trans, pred_res_mask = self.compute_frames(pred_coords, atom_names, res_map, atom_name_map)
+
+            # pred_data = {
+            #     'rots': pred_rots,
+            #     'trans': pred_trans,
+            #     'coords': pred_coords,
+            #     'res_mask': pred_res_mask,
+            #     'mask': mask,
+            # }
+            # true_data = {
+            #     'rots': batch["rots_good"].to(self.device, non_blocking=True),
+            #     'trans': batch["trans_good"].to(self.device, non_blocking=True),
+            #     'coords': coords_good,
+            #     'atom_types': atom_types,
+            # }
+            # loss, metrics = self.loss_fn(pred_data, true_data)
+            true_data = {
+                'rots': batch["rots_good"].to(self.device, non_blocking=True),
+                'trans': batch["trans_good"].to(self.device, non_blocking=True),
+                'coords': coords_good,
+                'atom_types': atom_types,
+            }
+            loss, metrics = self.loss_fn(pred_data, true_data)
 
         if self.use_amp:
             self.scaler.scale(loss).backward()
@@ -153,7 +242,7 @@ class TrainingPipeline:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.clip_grad_norm)
             self.optimizer.step()
 
-        metrics['total'] = loss.detach()  # Add total loss to metrics for consistency
+        metrics['total'] = loss.detach()
         return loss.detach(), {k: v.detach() for k, v in metrics.items()}
 
     @torch.no_grad()
@@ -169,26 +258,19 @@ class TrainingPipeline:
 
         num_batches = len(dataloader) if hasattr(dataloader, "__len__") else 0
         for batch_idx, batch in enumerate(dataloader):
-            coords_bad = batch["coords_bad"].to(self.device, non_blocking=True)
-            coords_good = batch["coords_good"].to(self.device, non_blocking=True)
-            atom_types = batch["atom_types"].to(self.device, non_blocking=True)
-
-            residue_types = batch.get("residue_types", None)
-            if residue_types is not None:
-                residue_types = residue_types.to(self.device, non_blocking=True)
-
-            # mask optional
-            mask = batch.get("mask", None)
-            if mask is not None:
-                mask = mask.to(self.device, non_blocking=True)
+            # Переносим данные на устройство
+            batch = {k: v.to(self.device, non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
             with torch.cuda.amp.autocast(enabled=self.use_amp):
-                if self._model_accepts_mask():
-                    pred_coords = self.model(coords_bad, atom_types, residue_types, mask=mask)
-                else:
-                    pred_coords = self.model(coords_bad, atom_types, residue_types)
+                # Вызываем модель с батчем в виде словаря
+                pred_data = self.model(batch)
+                pred_coords = pred_data['coords']
 
             # compute metrics
+            coords_good = batch["coords_good"]
+            atom_types = batch["atom_types"]
+            mask = batch.get("mask", None)
+
             if self.metrics_calculator is not None:
                 try:
                     rmsd = self.metrics_calculator.compute_rmsd(pred_coords, coords_good, mask=mask)

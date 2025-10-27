@@ -171,7 +171,7 @@ def train_model(
     model = ProteinUpscaler(num_iterations=3)
     model.to(device)
 
-    loss_fn = ProteinUpscalingLoss(device=device)
+    loss_fn = ProteinUpscalingLoss()
     optimizer = get_optimizer(model, lr=lr)
     scheduler = get_scheduler(optimizer)
     metrics_calculator = QualityMetrics(device=device)

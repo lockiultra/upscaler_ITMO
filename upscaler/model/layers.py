@@ -202,3 +202,23 @@ class GeometricUpdateHead(nn.Module):
                 current_coords = current_coords * mask.unsqueeze(-1)
 
         return current_coords
+
+class FrameUpdateHead(nn.Module):
+    """Предсказывает обновления фреймов (вращение и сдвиг)."""
+    def __init__(self, d_model=256):
+        super().__init__()
+        # 6 выходов: 3 для вектора вращения, 3 для вектора сдвига
+        self.predictor = nn.Linear(d_model, 6)
+
+    def forward(self, node_feats):
+        """
+        Args:
+            node_feats: Tensor of shape [..., N_res, d_model]
+        Returns:
+            tuple: (rot_vec, trans_vec)
+                   rot_vec: [..., N_res, 3]
+                   trans_vec: [..., N_res, 3]
+        """
+        updates = self.predictor(node_feats)
+        rot_vec, trans_vec = torch.split(updates, 3, dim=-1)
+        return rot_vec, trans_vec

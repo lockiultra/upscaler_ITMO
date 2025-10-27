@@ -1,8 +1,9 @@
+import torch
 import torch.nn as nn
 
 from upscaler.model.encoders import ProteinEncoder
-from upscaler.model.layers import LocalRefinementBlock, GlobalAttentionBlock, CoordinatePredictor, ManifoldUpdateHead
-
+from upscaler.model.layers import LocalRefinementBlock, GlobalAttentionBlock, FrameUpdateHead
+from upscaler.model.geometric import rots_from_vec, apply_frames, invert_frames
 
 class MultiScaleProteinUpscaler(nn.Module):
     def __init__(self, num_iterations=3):
@@ -25,47 +26,93 @@ class MultiScaleProteinUpscaler(nn.Module):
             GlobalAttentionBlock(d_model=d_model, n_heads=8),
             GlobalAttentionBlock(d_model=d_model, n_heads=8),
         ])
-        # self.coordinate_predictor = CoordinatePredictor(d_model=d_model)
-        self.update_head = ManifoldUpdateHead(d_model=d_model)
+        self.update_head = FrameUpdateHead(d_model=d_model)
 
         self.num_iterations = num_iterations
 
-    def forward(self, coords, atom_types, residue_types, mask=None):
-        refined_coords = coords
+    def forward(self, batch):
+        coords_bad = batch['coords_bad']
+        atom_types = batch['atom_types']
+        res_types = batch['residue_types']
+        mask = batch['mask']
+        res_mask = batch['res_mask']
+        res_map = batch['res_map']
         
-        for _ in range(self.num_iterations):
-            node_feats = self.encoder(refined_coords, atom_types, residue_types)
-            
-            if mask is not None:
-                maskf = mask.unsqueeze(-1).to(node_feats.dtype)
-                node_feats = node_feats * maskf
-            
-            residual = node_feats
-            for block in self.local_blocks:
-                node_feats = block(node_feats, refined_coords) + residual
-                if mask is not None:
-                    node_feats = node_feats * maskf
-                residual = node_feats
-            
-            residual = node_feats
-            for block in self.global_blocks:
-                try:
-                    node_feats = block(node_feats, mask=mask) + residual
-                except TypeError:
-                    node_feats = block(node_feats) + residual
-                residual = node_feats
-            
-            # coord_updates = self.coordinate_predictor(node_feats)
-            
-            # if mask is not None:
-            #     mask3 = mask.unsqueeze(-1).to(coord_updates.dtype)
-            #     coord_updates = coord_updates * mask3
-            
-            # refined_coords = refined_coords + coord_updates
+        # Начальные фреймы из low-res структуры
+        current_rots, current_trans = batch['rots_bad'], batch['trans_bad']
 
-            refined_coords = self.update_head(node_feats, refined_coords, mask=mask)
+        for _ in range(self.num_iterations):
+            # 1. Собираем признаки остатков из признаков атомов (усредняем)
+            # Это упрощение, в реальных моделях здесь стоит GNN
+            res_feats = self._pool_atom_feats_to_res(
+                self.encoder(coords_bad, atom_types, res_types), 
+                res_map, 
+                res_mask
+            )
+
+            # 2. Обновляем признаки остатков
+            residual = res_feats
+            for block in self.local_blocks: # Local/Global блоки теперь работают на уровне остатков
+                res_feats = block(res_feats, current_trans) + residual
+                residual = res_feats
+            
+            for block in self.global_blocks:
+                res_feats = block(res_feats, mask=res_mask) + residual
+                residual = res_feats
+
+            # 3. Предсказываем обновления фреймов
+            rot_update_vec, trans_update_vec = self.update_head(res_feats)
+            
+            # 4. Применяем обновления
+            rot_update_mat = rots_from_vec(rot_update_vec)
+            
+            # Композиция фреймов
+            current_rots = torch.einsum('...ij,...jk->...ik', rot_update_mat, current_rots)
+            current_trans = current_trans + torch.einsum('...ij,...j->...i', current_rots, trans_update_vec)
+
+            # Маскируем, чтобы паддинг не "улетал"
+            current_trans = current_trans * res_mask.unsqueeze(-1)
         
-        return refined_coords
+        # 5. Генерируем финальные координаты атомов
+        inv_rots_bad, inv_trans_bad = invert_frames(batch['rots_bad'], batch['trans_bad'])
+        
+        # Собираем инвертированные фреймы для каждого атома
+        atom_inv_rots = inv_rots_bad.gather(1, res_map.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 3, 3))
+        atom_inv_trans = inv_trans_bad.gather(1, res_map.unsqueeze(-1).expand(-1, -1, 3))
+        
+        # Локальные координаты
+        local_coords = apply_frames(atom_inv_rots, atom_inv_trans, coords_bad)
+        
+        # Собираем финальные фреймы для каждого атома
+        atom_rots_final = current_rots.gather(1, res_map.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 3, 3))
+        atom_trans_final = current_trans.gather(1, res_map.unsqueeze(-1).expand(-1, -1, 3))
+
+        # Применяем финальные фреймы
+        final_coords = apply_frames(atom_rots_final.transpose(-1,-2), atom_trans_final, local_coords)
+        
+        return {
+            'rots': current_rots,
+            'trans': current_trans,
+            'coords': final_coords,
+            'res_mask': res_mask,
+            'mask': mask
+        }
+
+    def _pool_atom_feats_to_res(self, atom_feats, res_map, res_mask):
+        B, N_res = res_mask.shape
+        D = atom_feats.shape[-1]
+        
+        res_feats = torch.zeros(B, N_res, D, device=atom_feats.device)
+        res_map_exp = res_map.unsqueeze(-1).expand(-1, -1, D)
+        
+        res_feats.scatter_add_(1, res_map_exp, atom_feats)
+        
+        # Нормализуем
+        counts = torch.zeros(B, N_res, 1, device=atom_feats.device)
+        counts.scatter_add_(1, res_map.unsqueeze(-1), torch.ones_like(atom_feats[..., :1]))
+        
+        return res_feats / (counts + 1e-8)
+
 
 
 ProteinUpscaler = MultiScaleProteinUpscaler
