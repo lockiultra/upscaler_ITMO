@@ -38,6 +38,7 @@ def _get_residue_data(coords, atom_names, res_names, res_seqs):
 
     bb_coords_list = []
     res_map = torch.full((len(coords),), -1, dtype=torch.long)
+    atom_mask = torch.zeros(len(coords), dtype=torch.bool)  # NEW: маска валидных атомов
     
     new_res_idx = 0
     for res_id in sorted(residues.keys()):
@@ -50,24 +51,17 @@ def _get_residue_data(coords, atom_names, res_names, res_seqs):
             
             for atom_original_index in res['indices']:
                 res_map[atom_original_index] = new_res_idx
+                atom_mask[atom_original_index] = True  # NEW: отмечаем валидные атомы
             new_res_idx += 1
 
     if not bb_coords_list:
-        return None, None
+        return None, None, None
 
     final_bb_coords = torch.from_numpy(np.stack(bb_coords_list, axis=0)).float()
-    return final_bb_coords, res_map
+    return final_bb_coords, res_map, atom_mask  # NEW: возвращаем маску
 
 
 class ProteinUpscalingDataset(Dataset):
-    """Датасет пар «плохое разрешение → хорошее» для белков.
-
-    Изменения:
-      - добавлен параметр max_atoms: ограничивает число атомов в выборке (subsample если слишком много)
-      - prefilter_cache теперь хранит строки `idx,length,rmsd`
-      - внутренние словари _lengths_by_idx, _rmsd_by_idx
-      - __getitem__ возвращает поле 'length'
-    """
     def __init__(
         self,
         csv_file: str | os.PathLike,
@@ -84,7 +78,10 @@ class ProteinUpscalingDataset(Dataset):
              'CL', 'BR', 'I', 'F']
         )
         self.atom_name_map = self._build_map(
-            ['N', 'CA', 'C', 'O', 'CB', 'CG', 'CG1', 'CG2', 'CD', 'CD1', 'CD2', 'CE', 'CE1', 'CE2', 'CE3', 'CZ', 'CZ2', 'CZ3', 'CH2', 'ND1', 'ND2', 'NE', 'NE1', 'NE2', 'NH1', 'NH2', 'NZ', 'OD1', 'OD2', 'OE1', 'OE2', 'OG', 'OG1', 'OH', 'SD', 'SE', 'SG']
+            ['N', 'CA', 'C', 'O', 'CB', 'CG', 'CG1', 'CG2', 'CD', 'CD1', 'CD2', 
+             'CE', 'CE1', 'CE2', 'CE3', 'CZ', 'CZ2', 'CZ3', 'CH2', 'ND1', 'ND2', 
+             'NE', 'NE1', 'NE2', 'NH1', 'NH2', 'NZ', 'OD1', 'OD2', 'OE1', 'OE2', 
+             'OG', 'OG1', 'OH', 'SD', 'SE', 'SG']
         )
         self.residue_type_map = self._build_map(
             ['ALA', 'ARG', 'ASN', 'ASP', 'CYS', 'GLN', 'GLU', 'GLY', 'HIS', 'ILE',
@@ -131,20 +128,13 @@ class ProteinUpscalingDataset(Dataset):
         raise FileNotFoundError(f"Structure file for {pdb_id} not found. Tried: {tried_paths}")
 
     def _is_pair_alignable(self, idx: int) -> tuple[bool, int, float]:
-        """Проверяет, можно ли выровнять пару с заданным индексом.
-
-        Возвращает: (is_alignable, length, rmsd)
-        rmsd = float('inf') при ошибке.
-        """
         try:
             good_row, bad_row = self.all_pairs[idx]
             good_path = self._find_structure_file(good_row['pdb'])
             bad_path = self._find_structure_file(bad_row['pdb'])
-            # low_coords, high_coords, atom_elements, atom_names, res_names, res_seqs = align_structures(str(bad_path), str(good_path))
             low_coords, high_coords, _, _, _, _ = align_structures(str(bad_path), str(good_path))
             if low_coords.shape[0] == 0:
                 return False, 0, float('inf')
-            # Вычисляем RMSD после Kabsch (superimpose high -> low)
             _, rmsd, _, _ = kabsch_superimpose(low_coords, high_coords)
             return True, int(low_coords.shape[0]), float(rmsd)
         except (FileNotFoundError, ValueError) as e:
@@ -155,10 +145,6 @@ class ProteinUpscalingDataset(Dataset):
             return False, 0, float('inf')
 
     def _load_or_create_good_indices(self) -> list[int]:
-        """Загружает индексы хороших пар из кэша или создаёт их.
-
-        Кеш в файле хранит строки вида: idx,length,rmsd
-        """
         if self.prefilter_cache and self.prefilter_cache.exists():
             logger.info(f"Loading good pair indices from cache: {self.prefilter_cache}")
             try:
@@ -218,7 +204,6 @@ class ProteinUpscalingDataset(Dataset):
         return len(self.good_pair_indices)
 
     def get_num_atoms(self, dataset_index: int) -> int:
-        """Возвращает число атомов для образца в датасете (по позиции dataset_index)."""
         actual_idx = self.good_pair_indices[dataset_index]
         return int(self._lengths_by_idx.get(actual_idx, 0))
 
@@ -234,7 +219,9 @@ class ProteinUpscalingDataset(Dataset):
             raise e
 
         try:
-            low_coords, high_coords, atom_elements, atom_names, res_names, res_seqs = align_structures(str(bad_path), str(good_path))
+            low_coords, high_coords, atom_elements, atom_names, res_names, res_seqs = align_structures(
+                str(bad_path), str(good_path)
+            )
         except ValueError as e:
             logger.error(f"Alignment failed for pair {actual_idx} ({bad_row['pdb']}, {good_row['pdb']}): {e}")
             raise e
@@ -243,54 +230,78 @@ class ProteinUpscalingDataset(Dataset):
             aligned_high_coords, _, _, _ = kabsch_superimpose(low_coords, high_coords)
             high_coords = aligned_high_coords
 
-        bb_coords_bad, res_map_bad = _get_residue_data(low_coords, atom_names, res_names, res_seqs)
-        bb_coords_good, res_map_good = _get_residue_data(high_coords, atom_names, res_names, res_seqs)
+        bb_coords_bad, res_map_bad, atom_mask_bad = _get_residue_data(
+            low_coords, atom_names, res_names, res_seqs
+        )
+        bb_coords_good, res_map_good, atom_mask_good = _get_residue_data(
+            high_coords, atom_names, res_names, res_seqs
+        )
 
         if bb_coords_bad is None or bb_coords_good is None:
-             return self.__getitem__((idx + 1) % len(self))
+            return self.__getitem__((idx + 1) % len(self))
 
-        rots_bad, trans_bad = frames_from_bb_coords(bb_coords_bad[:,0], bb_coords_bad[:,1], bb_coords_bad[:,2])
-        rots_good, trans_good = frames_from_bb_coords(bb_coords_good[:,0], bb_coords_good[:,1], bb_coords_good[:,2])
+        if not torch.equal(atom_mask_bad, atom_mask_good):
+            logger.warning(f"Atom masks mismatch for pair {actual_idx}, trying next sample")
+            return self.__getitem__((idx + 1) % len(self))
+
+        rots_bad, trans_bad = frames_from_bb_coords(
+            bb_coords_bad[:,0], bb_coords_bad[:,1], bb_coords_bad[:,2]
+        )
+        rots_good, trans_good = frames_from_bb_coords(
+            bb_coords_good[:,0], bb_coords_good[:,1], bb_coords_good[:,2]
+        )
 
         atom_ids = [self.atom_type_map.get(a, 0) for a in atom_elements]
         res_ids  = [self.residue_type_map.get(r, 0) for r in res_names]
         atom_name_ids = [self.atom_name_map.get(name, 0) for name in atom_names]
 
+        valid_indices = atom_mask_bad.nonzero(as_tuple=True)[0]
+        
         return {
-            "coords_bad": torch.from_numpy(low_coords).float(),
-            "coords_good": torch.from_numpy(high_coords).float(),
+            "coords_bad": torch.from_numpy(low_coords[valid_indices]).float(),
+            "coords_good": torch.from_numpy(high_coords[valid_indices]).float(),
             "rots_bad": rots_bad,
             "trans_bad": trans_bad,
             "rots_good": rots_good,
             "trans_good": trans_good,
-            "res_map": res_map_bad,
-            "atom_names": torch.tensor(atom_name_ids, dtype=torch.long), # Add this line
-            "atom_types": torch.tensor(atom_ids, dtype=torch.long),
-            "residue_types": torch.tensor(res_ids, dtype=torch.long),
-            "length": torch.tensor(low_coords.shape[0], dtype=torch.long),
+            "res_map": res_map_bad[valid_indices],
+            "atom_names": torch.tensor([atom_name_ids[i] for i in valid_indices], dtype=torch.long),
+            "atom_types": torch.tensor([atom_ids[i] for i in valid_indices], dtype=torch.long),
+            "residue_types": torch.tensor([res_ids[i] for i in valid_indices], dtype=torch.long),
+            "length": torch.tensor(len(valid_indices), dtype=torch.long),
+            "num_residues": torch.tensor(bb_coords_bad.shape[0], dtype=torch.long),
         }
 
 
 def collate_batch(batch):
-    keys = batch[0].keys()
-    out = {k: pad_sequence([b[k] for b in batch], batch_first=True) for k in keys if k not in ['length', 'mask']}
+    keys = ['coords_bad', 'coords_good', 'atom_names', 'atom_types', 'residue_types', 'res_map']
+    out = {}
     
+    # Padding для атомных данных
+    for k in keys:
+        out[k] = pad_sequence([b[k] for b in batch], batch_first=True, padding_value=0)
+    
+    # Padding для фреймов остатков
+    out['rots_bad'] = pad_sequence([b['rots_bad'] for b in batch], batch_first=True, padding_value=0)
+    out['trans_bad'] = pad_sequence([b['trans_bad'] for b in batch], batch_first=True, padding_value=0)
+    out['rots_good'] = pad_sequence([b['rots_good'] for b in batch], batch_first=True, padding_value=0)
+    out['trans_good'] = pad_sequence([b['trans_good'] for b in batch], batch_first=True, padding_value=0)
+    
+    # Длины и маски
     out['lengths'] = torch.tensor([b['length'] for b in batch], dtype=torch.long)
     max_len = out['coords_bad'].shape[1]
     arange = torch.arange(max_len).unsqueeze(0)
     out['mask'] = (arange < out['lengths'].unsqueeze(1))
     
+    num_residues = torch.tensor([b['num_residues'] for b in batch], dtype=torch.long)
     max_res_len = out['rots_bad'].shape[1]
-    res_lengths = torch.tensor([b['rots_bad'].shape[0] for b in batch], dtype=torch.long)
     res_arange = torch.arange(max_res_len).unsqueeze(0)
-    out['res_mask'] = (res_arange < res_lengths.unsqueeze(1))
+    out['res_mask'] = (res_arange < num_residues.unsqueeze(1))
     
     return out
 
 
-# ----------------- BucketBatchSampler -----------------
 class BucketBatchSampler(Sampler):
-    """Группирует индексы по длине и формирует батчи, чтобы минимизировать padding внутри батча."""
     def __init__(self, dataset: ProteinUpscalingDataset, batch_size: int, num_buckets: int = 20, shuffle: bool = True):
         self.dataset = dataset
         self.batch_size = batch_size
@@ -317,30 +328,23 @@ class BucketBatchSampler(Sampler):
         return total
 
 
-# ----------------- CurriculumSampler -----------------
 class CurriculumSampler(Sampler):
-    """
-    Простейшая реализация curriculum sampler по RMSD: на ранних эпохах выдаёт только "простиые" примеры
-    (малый rmsd). Метод get_epoch_iterator(epoch) возвращает последовательность батч-индексов.
-    """
     def __init__(self, dataset: ProteinUpscalingDataset, batch_size: int, schedule_fn=None, shuffle_within_bucket: bool = True):
         self.dataset = dataset
         self.batch_size = batch_size
         self.shuffle_within_bucket = shuffle_within_bucket
 
-        # индексы внутри датасета (0..len-1)
         self._idxs = list(range(len(dataset)))
-        # сортируем по сложности (rmsd)
+        
         def _rmsd_for_dataset_idx(i):
             actual_idx = dataset.good_pair_indices[i]
             return dataset._rmsd_by_idx.get(actual_idx, float('inf'))
-        # If no RMSDs, fallback to uniform
+        
         if not dataset._rmsd_by_idx:
             self.sorted_by_difficulty = list(range(len(dataset)))
         else:
             self.sorted_by_difficulty = sorted(self._idxs, key=_rmsd_for_dataset_idx)
 
-        # schedule_fn(epoch, max_rmsd) -> threshold
         self.schedule_fn = schedule_fn or (lambda epoch, max_rmsd: max_rmsd * min(1.0, (epoch + 1) / 20.0))
 
     def __iter__(self):
@@ -350,7 +354,8 @@ class CurriculumSampler(Sampler):
         max_rmsd_all = max(self.dataset._rmsd_by_idx.values()) if self.dataset._rmsd_by_idx else 0.0
         max_rmsd_all = max_rmsd_all or 1.0 
         thr = self.schedule_fn(epoch, max_rmsd_all)
-        allowed = [i for i in self.sorted_by_difficulty if self.dataset._rmsd_by_idx.get(self.dataset.good_pair_indices[i], float('inf')) <= thr]
+        allowed = [i for i in self.sorted_by_difficulty 
+                   if self.dataset._rmsd_by_idx.get(self.dataset.good_pair_indices[i], float('inf')) <= thr]
         if not allowed:
             allowed = self.sorted_by_difficulty[:max(1, len(self.sorted_by_difficulty)//100)]
         if self.shuffle_within_bucket:

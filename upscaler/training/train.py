@@ -28,7 +28,7 @@ def get_optimizer(model: nn.Module, lr: float = 1e-4) -> torch.optim.Optimizer:
 
 def get_scheduler(optimizer: torch.optim.Optimizer) -> torch.optim.lr_scheduler._LRScheduler:
     return torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", patience=5, factor=0.5, verbose=True
+        optimizer, mode="min", patience=5, factor=0.5
     )
 
 
@@ -98,7 +98,7 @@ def build_dataloaders(
     val_subset = Subset(dataset, val_indices)
 
     if use_curriculum:
-        train_loader = None  # Will be handled per-epoch
+        train_loader = None
     elif use_bucket:
         lengths = [dataset.get_num_atoms(i) for i in train_indices]
         pairs = list(zip(train_indices, lengths))

@@ -111,6 +111,7 @@ class ClashLoss(nn.Module):
     def forward(self, coords, atom_types, vdw_radii=VDW_RADII_TENSOR, eps=1e-8):
         """Вычисляет штраф за стерические столкновения."""
         # Получаем радиусы Ван-дер-Ваальса для каждого атома
+        vdw_radii = vdw_radii.to(atom_types.device)
         radii = vdw_radii[atom_types]
         
         # Вычисляем все попарные расстояния
