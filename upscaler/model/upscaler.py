@@ -40,79 +40,106 @@ class MultiScaleProteinUpscaler(nn.Module):
         self.num_iterations = num_iterations
 
     def forward(self, batch):
-        coords_bad = batch['coords_bad']
-        atom_types = batch['atom_types']
-        res_types = batch['residue_types']
-        mask = batch['mask']
-        res_mask = batch['res_mask']
-        res_map = batch['res_map']
+        device = next(self.parameters()).device
+        coords_bad = batch['coords_bad'].to(device)
+        atom_types = batch['atom_types'].to(device)
+        res_types = batch['residue_types'].to(device)
+        if 'mask' in batch:
+            mask = batch['mask'].to(device)
+        else:
+            mask = None
+        if 'res_mask' in batch:
+            res_mask = batch['res_mask'].to(device)
+        else:
+            res_mask = None
+        if 'res_map' in batch:
+            res_map = batch['res_map'].to(device)
+        else:
+            res_map = None
         
         B, N_atoms = coords_bad.shape[:2]
         N_res = batch['rots_bad'].shape[1]
-        
-        # Проверка на невалидные индексы
-        invalid_mask = (res_map < 0) | (res_map >= N_res)
-        if invalid_mask.any():
-            res_map = res_map.clone()
-            res_map[invalid_mask] = 0
-            # Обновляем маску атомов
-            mask = mask & (~invalid_mask)
-        
-        # Начальные фреймы из low-res структуры
-        current_rots, current_trans = batch['rots_bad'], batch['trans_bad']
+
+        # Защита от невалидных индексов остатков (только если есть res_map и mask)
+        if res_map is not None:
+            invalid_mask = (res_map < 0) | (res_map >= N_res)
+            if invalid_mask.any():
+                res_map = res_map.clone()
+                res_map[invalid_mask] = 0
+                if mask is not None:
+                    mask = mask & (~invalid_mask)
+
+        initial_rots = batch['rots_bad'].to(device)
+        initial_trans = batch['trans_bad'].to(device)
+
+        # Маска валидных residue-фреймов: для паддинговых остатков
+        # принудительно ставим identity-rotation и нулевой translation, чтобы
+        # rots_from_vec×current_rots не разъезжалось в NaN.
+        if res_mask is not None:
+            rm = res_mask.to(dtype=initial_rots.dtype).unsqueeze(-1).unsqueeze(-1)
+            eye = torch.eye(3, device=device, dtype=initial_rots.dtype).expand_as(initial_rots)
+            initial_rots = initial_rots * rm + eye * (1.0 - rm)
+            initial_trans = initial_trans * res_mask.unsqueeze(-1).to(initial_trans.dtype)
+
+        current_rots = initial_rots.clone()
+        current_trans = initial_trans.clone()
 
         for iteration in range(self.num_iterations):
             # 1. Собираем признаки остатков из признаков атомов (усредняем)
             res_feats = self._pool_atom_feats_to_res(
-                self.encoder(coords_bad, atom_types, res_types), 
-                res_map, 
+                self.encoder(coords_bad, atom_types, res_types, mask=mask),
+                res_map,
                 res_mask,
                 mask
             )
 
-            # 2. Локальные блоки
-            residual = res_feats
+            # 2. Локальные блоки: классический residual — складываем с входом блока,
+            # а не с накапливающейся суммой (иначе активации растут как 2^k).
+            local_in = res_feats
             for block in self.local_blocks:
-                res_feats = block(res_feats, current_trans) + residual
-                residual = res_feats
+                res_feats = block(res_feats, current_trans, mask=res_mask) + local_in
 
             B, N_res, _ = current_trans.shape
-            t_i = current_trans.unsqueeze(2)  # (B, N, 1, 3)
-            t_j = current_trans.unsqueeze(1)  # (B, 1, N, 3)
-            rel = t_i - t_j                    # (B, N, N, 3)
-            dist = torch.norm(rel, dim=-1, keepdim=True)  # (B, N, N, 1)
-            pair_feats = torch.cat([rel, dist], dim=-1)   # (B, N, N, 4)
+            t_i = current_trans.unsqueeze(2)
+            t_j = current_trans.unsqueeze(1)
+            rel = t_i - t_j
+            dist = torch.norm(rel, dim=-1, keepdim=True)
+            pair_feats = torch.cat([rel, dist], dim=-1)
+            pairwise_repr = self.pair_proj(pair_feats)
+            mask_bool = res_mask.bool() if res_mask is not None else None
 
-            pairwise_repr = self.pair_proj(pair_feats)    # (B, N, N, d_model)
-            mask_bool = res_mask.bool()
-
-            # 3. IPA-блоки
+            # 3. IPA-блоки: тот же фикс residual.
+            ipa_in = res_feats
             for ipa in self.ipa_blocks:
                 res_out = ipa(
                     res_feats,
                     pairwise_repr,
-                    rotations = current_rots,
-                    translations = current_trans,
-                    mask = mask_bool
+                    rotations=current_rots,
+                    translations=current_trans,
+                    mask=mask_bool,
                 )
-                if isinstance(res_out, tuple) or isinstance(res_out, list):
+                if isinstance(res_out, (tuple, list)):
                     res_feats = res_out[0]
                 else:
                     res_feats = res_out
-
-                res_feats = res_feats + residual
-                residual = res_feats
+                res_feats = res_feats + ipa_in
 
             # 4. Предсказываем обновления фреймов
             rot_update_vec, trans_update_vec = self.update_head(res_feats)
-            
-            # 5. Применяем обновления фреймов
-            rot_update_mat = rots_from_vec(rot_update_vec)            
-            current_rots = torch.einsum('...ij,...jk->...ik', rot_update_mat, current_rots)
-            current_trans = current_trans + torch.einsum('...ij,...j->...i', current_rots, trans_update_vec)
 
-            # Маскируем
-            current_trans = current_trans * res_mask.unsqueeze(-1)
+            # 5. Применяем обновления фреймов
+            rot_update_mat = rots_from_vec(rot_update_vec)
+            current_rots = torch.einsum('...ij,...jk->...ik', rot_update_mat, current_rots)
+            current_trans = current_trans + torch.einsum(
+                '...ij,...j->...i', current_rots, trans_update_vec
+            )
+
+            # Маскируем паддинг и в rotations, и в translations
+            if res_mask is not None:
+                rm = res_mask.to(dtype=current_rots.dtype).unsqueeze(-1).unsqueeze(-1)
+                eye = torch.eye(3, device=device, dtype=current_rots.dtype).expand_as(current_rots)
+                current_rots = current_rots * rm + eye * (1.0 - rm)
+                current_trans = current_trans * res_mask.unsqueeze(-1).to(current_trans.dtype)
         
         # Финальная генерация координат атомов
         final_coords = self._compute_final_coords(
@@ -120,8 +147,8 @@ class MultiScaleProteinUpscaler(nn.Module):
             res_map, 
             current_rots, 
             current_trans,
-            batch['rots_bad'],
-            batch['trans_bad'],
+            initial_rots,
+            initial_trans,
             mask
         )
         
@@ -136,28 +163,26 @@ class MultiScaleProteinUpscaler(nn.Module):
     def _pool_atom_feats_to_res(self, atom_feats, res_map, res_mask, atom_mask=None):
         B, N_res = res_mask.shape
         D = atom_feats.shape[-1]
-        
-        res_feats = torch.zeros(B, N_res, D, device=atom_feats.device)
-        
+
+        # Все буферы создаём с dtype/device от atom_feats — иначе под AMP
+        # (float16 / bfloat16) scatter_add_ выдаст type-mismatch.
+        res_feats = atom_feats.new_zeros(B, N_res, D)
+        counts = atom_feats.new_zeros(B, N_res, 1)
+
         res_map_clamped = torch.clamp(res_map, 0, N_res - 1)
         res_map_exp = res_map_clamped.unsqueeze(-1).expand(-1, -1, D)
-        
-        # Применяем маску атомов если есть
+
+        # Маска атомов: float того же dtype, что и features.
         if atom_mask is not None:
-            masked_feats = atom_feats * atom_mask.unsqueeze(-1).float()
+            atom_mask_f = atom_mask.to(dtype=atom_feats.dtype).unsqueeze(-1)
+            masked_feats = atom_feats * atom_mask_f
         else:
             masked_feats = atom_feats
-        
+            atom_mask_f = atom_feats.new_ones(B, atom_feats.shape[1], 1)
+
         res_feats.scatter_add_(1, res_map_exp, masked_feats)
-        
-        # Нормализуем
-        counts = torch.zeros(B, N_res, 1, device=atom_feats.device)
-        if atom_mask is not None:
-            counts.scatter_add_(1, res_map_clamped.unsqueeze(-1), atom_mask.unsqueeze(-1).float())
-        else:
-            counts.scatter_add_(1, res_map_clamped.unsqueeze(-1), torch.ones_like(atom_feats[..., :1]))
-        
-        # Избегаем деления на ноль
+        counts.scatter_add_(1, res_map_clamped.unsqueeze(-1), atom_mask_f)
+
         counts = torch.clamp(counts, min=1.0)
         return res_feats / counts
 
@@ -208,10 +233,10 @@ class MultiScaleProteinUpscaler(nn.Module):
             res_map_clamped.view(B, N_atoms, 1, 1).expand(-1, -1, 1, 3)
         ).squeeze(2)
 
-        # Применяем финальные фреймы
+        # Применяем финальные фреймы (local -> world): world = R @ local + t
         final_coords = apply_frames(
-            atom_rots_final.transpose(-1, -2), 
-            atom_trans_final, 
+            atom_rots_final,
+            atom_trans_final,
             local_coords
         )
         

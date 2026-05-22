@@ -39,30 +39,36 @@ class QualityMetrics:
 
     @staticmethod
     def compute_rmsd(pred_coords, true_coords, eps=1e-8, mask=None):
+        """Kabsch-aligned RMSD по батчу.
+
+        Если ``mask`` не передана, неявно фильтруем строки, где обе
+        координаты ровно (0,0,0) — типичный признак паддинга после
+        ``pad_sequence``. Это защищает caller-ов, забывших mask, от
+        систематически неверного RMSD.
         """
-        Вычисляет Root Mean Square Deviation (RMSD).
-        
-        Args:
-            pred_coords (torch.Tensor): Предсказанные координаты [..., N, 3].
-            true_coords (torch.Tensor): Истинные координаты [..., N, 3].
-            eps (float): Малое значение для стабильности sqrt.
-            
-        Returns:
-            torch.Tensor: Скалярный тензор со значением RMSD.
-        """
+        if mask is None:
+            pad_mask = (pred_coords.abs().sum(dim=-1) < eps) & (
+                true_coords.abs().sum(dim=-1) < eps
+            )
+            mask = ~pad_mask
+
         rmsds = []
         for i in range(pred_coords.shape[0]):
-            pred_i = pred_coords[i][mask[i]] if mask is not None else pred_coords[i]
-            true_i = true_coords[i][mask[i]] if mask is not None else true_coords[i]
+            row_mask = mask[i].to(dtype=torch.bool)
+            pred_i = pred_coords[i][row_mask]
+            true_i = true_coords[i][row_mask]
             if len(pred_i) > 0:
-                aligned, rmsd, _, _ = kabsch_superimpose(true_i.cpu().numpy(), pred_i.cpu().numpy())
+                _, rmsd, _, _ = kabsch_superimpose(
+                    true_i.detach().cpu().numpy(),
+                    pred_i.detach().cpu().numpy(),
+                )
                 rmsds.append(rmsd)
-        return torch.tensor(rmsds, device=pred_coords.device).mean() if rmsds else torch.tensor(0.0, device=pred_coords.device)
-        # diff = pred_coords - true_coords
-        # return torch.sqrt(torch.mean(torch.sum(diff**2, dim=-1)) + eps)
+        if not rmsds:
+            return torch.tensor(0.0, device=pred_coords.device)
+        return torch.tensor(rmsds, device=pred_coords.device).mean()
 
     @staticmethod
-    def compute_lddt(pred_coords, true_coords, cutoff=15.0, eps=1e-8):
+    def compute_lddt(pred_coords, true_coords, cutoff=15.0, eps=1e-8, mask=None):
         """
         Вычисляет Local Distance Difference Test (lDDT) score.
         lDDT находится в диапазоне [0, 1], где 1 - идеальное совпадение.
@@ -82,6 +88,12 @@ class QualityMetrics:
         
         # Маска для локальных взаимодействий
         local_mask = (true_distances < cutoff) & (true_distances > eps)
+
+        # Учитываем маску паддинга атомов (если задана)
+        if mask is not None:
+            m = mask.to(dtype=torch.bool)
+            pair_mask = m.unsqueeze(-1) & m.unsqueeze(-2)
+            local_mask = local_mask & pair_mask
         
         # Вычисление разницы расстояний
         diff = torch.abs(pred_distances - true_distances)
@@ -108,7 +120,7 @@ class QualityMetrics:
         # Возвращаем средний lDDT по всем примерам в батче
         return torch.mean(lddt_per_sample)
 
-    def compute_clash_score(self, coords, atom_types, eps=1e-8):
+    def compute_clash_score(self, coords, atom_types, eps=1e-8, mask=None):
         """
         Подсчитывает количество стерических столкновений.
         
@@ -131,16 +143,25 @@ class QualityMetrics:
         
         # Маска для столкновений: расстояние < минимальное расстояние
         clashes = (distances < min_distances) & (distances > eps)
-        
+
+        # Учитываем маску паддинга атомов (если задана)
+        if mask is not None:
+            m = mask.to(dtype=torch.bool)
+            pair_mask = m.unsqueeze(-1) & m.unsqueeze(-2)
+            clashes = clashes & pair_mask
+            valid_atoms = m.float().sum(dim=-1)
+        else:
+            valid_atoms = torch.full(
+                coords.shape[:-2], float(coords.shape[-2]),
+                device=coords.device, dtype=coords.dtype
+            )
+
         # Подсчитываем количество столкновений
         num_clashes = torch.sum(clashes.float(), dim=(-1, -2)) / 2.0 # [...]
-        
-        # Нормализуем по количеству атомов
-        num_atoms = coords.shape[-2]
-        if num_atoms > 0:
-            clash_score_per_sample = num_clashes / num_atoms
-        else:
-            clash_score_per_sample = torch.zeros_like(num_clashes)
+
+        # Нормализуем по количеству валидных атомов
+        valid_atoms = torch.clamp(valid_atoms, min=1.0)
+        clash_score_per_sample = num_clashes / valid_atoms
         
         # Возвращаем средний clash score по всем примерам в батче
         return torch.mean(clash_score_per_sample)

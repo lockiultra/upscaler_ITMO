@@ -4,8 +4,8 @@ import torch.nn.functional as F
 from e3nn import o3
 from e3nn.o3 import FullyConnectedTensorProduct, Linear
 from torch_geometric.nn import MessagePassing
-from pytorch3d.transforms import quaternion_apply
-from pytorch3d.transforms.rotation_conversions import axis_angle_to_quaternion
+# from pytorch3d.transforms import quaternion_apply
+# from pytorch3d.transforms.rotation_conversions import axis_angle_to_quaternion
 
 from upscaler.model.encoders import build_knn_graph
 
@@ -69,21 +69,31 @@ class LocalRefinementBlock(nn.Module):
             self.irreps_edge_attr
         )
 
-    def forward(self, node_feats, coords):
+    def forward(self, node_feats, coords, mask=None):
         """
         Args:
             node_feats: Tensor of shape [B, N, d_model] (инвариантные признаки)
             coords: Tensor of shape [B, N, 3]
-        Returns:
-            refined_feats: Tensor of shape [B, N, d_model] (инвариантные признаки)
+            mask: optional bool mask [B, N] — паддинговые узлы не попадают
+                в kNN-граф.
         """
         batch_size, num_nodes, d_model = node_feats.shape
         d_model = self.irreps_input.dim
-        
-        # Строим локальный граф
-        edge_index = build_knn_graph(coords, k=self.k)
-        
-        # Преобразуем координаты в векторные атрибуты ребер
+
+        # Строим локальный граф. Паддинговые координаты сдвигаем «в бесконечность»,
+        # чтобы они не оказались среди ближайших соседей реальных узлов.
+        device = coords.device
+        if mask is not None:
+            far = coords.new_full((), 1e6)
+            kgraph_coords = torch.where(mask.unsqueeze(-1), coords, far)
+        else:
+            kgraph_coords = coords
+        edge_index = build_knn_graph(kgraph_coords, k=self.k)
+        edge_index = edge_index.to(device)
+
+        # Преобразуем координаты в векторные атрибуты ребер. edge_attr
+        # считаем по исходным coords (не shifted), чтобы значения остались
+        # геометрически корректными для real→real рёбер.
         senders, receivers = edge_index
         sender_coords = coords.view(-1, 3)[senders]
         receiver_coords = coords.view(-1, 3)[receivers]
@@ -139,69 +149,69 @@ class CoordinatePredictor(nn.Module):
         return self.predictor(node_feats)
 
 
-class GeometricUpdateHead(nn.Module):
-    def __init__(self, d_model: int, num_modules: int = 8, max_translation: float = 3.0, max_rotation_angle: float = torch.pi):
-        super().__init__()
-        self.num_modules = num_modules
-        self.d_model = d_model
-        self.max_translation = max_translation
-        self.max_rotation_angle = max_rotation_angle
-        self.param_predictor = nn.Linear(d_model, num_modules * 8)
+# class GeometricUpdateHead(nn.Module):
+#     def __init__(self, d_model: int, num_modules: int = 8, max_translation: float = 3.0, max_rotation_angle: float = torch.pi):
+#         super().__init__()
+#         self.num_modules = num_modules
+#         self.d_model = d_model
+#         self.max_translation = max_translation
+#         self.max_rotation_angle = max_rotation_angle
+#         self.param_predictor = nn.Linear(d_model, num_modules * 8)
 
-    def forward(self, node_feats: torch.Tensor, coords: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
-        B, N, _ = coords.shape
+#     def forward(self, node_feats: torch.Tensor, coords: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+#         B, N, _ = coords.shape
 
-        input_dtype = coords.dtype
+#         input_dtype = coords.dtype
         
-        params = self.param_predictor(node_feats)
-        params = params.view(B, N, self.num_modules, 8)
+#         params = self.param_predictor(node_feats)
+#         params = params.view(B, N, self.num_modules, 8)
         
-        anchor_logits, select_logits, rot_axis, trans_vectors = torch.split(
-            params, [1, 1, 3, 3], dim=-1
-        )
+#         anchor_logits, select_logits, rot_axis, trans_vectors = torch.split(
+#             params, [1, 1, 3, 3], dim=-1
+#         )
         
-        anchor_weights = F.softmax(anchor_logits, dim=1)
-        select_probs = torch.sigmoid(select_logits)
+#         anchor_weights = F.softmax(anchor_logits, dim=1)
+#         select_probs = torch.sigmoid(select_logits)
 
-        rot_axis_float32 = rot_axis.float()
-        rot_angles = torch.norm(rot_axis_float32, dim=-1, keepdim=True)
-        rot_axis_norm = F.normalize(rot_axis_float32, dim=-1)
-        rot_angles = torch.tanh(rot_angles) * self.max_rotation_angle
+#         rot_axis_float32 = rot_axis.float()
+#         rot_angles = torch.norm(rot_axis_float32, dim=-1, keepdim=True)
+#         rot_axis_norm = F.normalize(rot_axis_float32, dim=-1)
+#         rot_angles = torch.tanh(rot_angles) * self.max_rotation_angle
         
-        quaternions = axis_angle_to_quaternion(rot_axis_norm * rot_angles)
+#         quaternions = axis_angle_to_quaternion(rot_axis_norm * rot_angles)
         
-        trans_vectors = torch.tanh(trans_vectors.float()) * self.max_translation
+#         trans_vectors = torch.tanh(trans_vectors.float()) * self.max_translation
 
-        current_coords = coords.clone()
+#         current_coords = coords.clone()
         
-        for i in range(self.num_modules):
-            q_i = quaternions[:, :, i, :]
-            t_i = trans_vectors[:, :, i, :]
-            anchor_w_i = anchor_weights[:, :, i].float()
-            select_p_i = select_probs[:, :, i].float()
+#         for i in range(self.num_modules):
+#             q_i = quaternions[:, :, i, :]
+#             t_i = trans_vectors[:, :, i, :]
+#             anchor_w_i = anchor_weights[:, :, i].float()
+#             select_p_i = select_probs[:, :, i].float()
 
-            current_coords_float32 = current_coords.float()
+#             current_coords_float32 = current_coords.float()
 
-            anchor_point = torch.sum(current_coords_float32 * anchor_w_i, dim=1, keepdim=True)
+#             anchor_point = torch.sum(current_coords_float32 * anchor_w_i, dim=1, keepdim=True)
             
-            sum_select_probs = select_p_i.sum(dim=1, keepdim=True).clamp(min=1e-8)
-            q_group = torch.sum(q_i * select_p_i, dim=1, keepdim=True) / sum_select_probs
-            t_group = torch.sum(t_i * select_p_i, dim=1, keepdim=True) / sum_select_probs
+#             sum_select_probs = select_p_i.sum(dim=1, keepdim=True).clamp(min=1e-8)
+#             q_group = torch.sum(q_i * select_p_i, dim=1, keepdim=True) / sum_select_probs
+#             t_group = torch.sum(t_i * select_p_i, dim=1, keepdim=True) / sum_select_probs
             
-            q_group = F.normalize(q_group, p=2, dim=-1)
+#             q_group = F.normalize(q_group, p=2, dim=-1)
 
-            centered_coords = current_coords_float32 - anchor_point
-            rotated_coords = quaternion_apply(q_group, centered_coords)
-            moved_coords = rotated_coords + anchor_point + t_group
+#             centered_coords = current_coords_float32 - anchor_point
+#             rotated_coords = quaternion_apply(q_group, centered_coords)
+#             moved_coords = rotated_coords + anchor_point + t_group
             
-            updated_coords_float32 = torch.lerp(current_coords_float32, moved_coords, select_p_i)
+#             updated_coords_float32 = torch.lerp(current_coords_float32, moved_coords, select_p_i)
             
-            current_coords = updated_coords_float32.to(input_dtype)
+#             current_coords = updated_coords_float32.to(input_dtype)
 
-            if mask is not None:
-                current_coords = current_coords * mask.unsqueeze(-1)
+#             if mask is not None:
+#                 current_coords = current_coords * mask.unsqueeze(-1)
 
-        return current_coords
+#         return current_coords
 
 class FrameUpdateHead(nn.Module):
     """Предсказывает обновления фреймов (вращение и сдвиг)."""
@@ -209,6 +219,8 @@ class FrameUpdateHead(nn.Module):
         super().__init__()
         # 6 выходов: 3 для вектора вращения, 3 для вектора сдвига
         self.predictor = nn.Linear(d_model, 6)
+        nn.init.zeros_(self.predictor.weight)
+        nn.init.zeros_(self.predictor.bias)
 
     def forward(self, node_feats):
         """
@@ -222,3 +234,5 @@ class FrameUpdateHead(nn.Module):
         updates = self.predictor(node_feats)
         rot_vec, trans_vec = torch.split(updates, 3, dim=-1)
         return rot_vec, trans_vec
+
+# /mnt/tank/scratch/dlibin/upscaler_ITMO/checkpoints/checkpoint_epoch_9.pt

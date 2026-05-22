@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import logging
 
+import os
+
 import numpy as np
-from Bio.PDB import PDBParser
+from Bio.PDB import PDBParser, MMCIFParser
 from Bio.PDB.Atom import Atom
 from Bio.PDB.Residue import Residue
 from Bio.PDB.Structure import Structure
@@ -12,47 +14,87 @@ from Bio.PDB.Structure import Structure
 LOGGER = logging.getLogger(__name__)
 
 
-def _atom_id_in_chain(atom: Atom) -> tuple[str, int, str]:
+def _atom_id_in_chain(atom: Atom) -> tuple[str, str, int, str, str, str]:
     """
-    Уникальный ключ атома внутри одной цепи:
-    (resname, resseq, atom.name)
+    Уникальный ключ атома, учитывающий цепь, hetflag, insertion code, altloc:
+    (chain_id, resname, resseq, icode, atom.name, altloc)
     """
     res: Residue = atom.get_parent()
-    return (res.resname.strip(), res.id[1], atom.name.strip())
+    chain_id = res.get_parent().id
+    hetflag, resseq, icode = res.id
+    altloc = atom.get_altloc() or ""
+    return (
+        str(chain_id),
+        res.resname.strip(),
+        int(resseq),
+        str(icode).strip(),
+        atom.name.strip(),
+        str(altloc).strip(),
+    )
+
+
+def _make_parser(path: str):
+    """Выбираем парсер исходя из расширения файла структуры."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".cif", ".mmcif"):
+        return MMCIFParser(QUIET=True)
+    return PDBParser(QUIET=True)
 
 
 def align_structures(
     low_path: str,
     high_path: str,
-) -> tuple[np.ndarray, np.ndarray, list[str], list[str]]:
-    """
-    Возвращает координаты low и high, выровненные по атомам.
-    Если атома нет в одной из структур – пропускаем.
+) -> tuple[
+    np.ndarray, np.ndarray,
+    list[str], list[str], list[str], list[int],
+    list[str], list[str],
+]:
+    """Возвращает выровненные по атомам координаты low/high структур.
+
+    Атом, отсутствующий в одной из структур, пропускается. Ключ атома
+    учитывает ``chain_id``, ``resname``, ``resseq``, ``icode``, ``atom_name``,
+    ``altloc`` — это важно для multi-chain и неоднозначных residues.
 
     Returns
     -------
-    low_coords : np.ndarray (N, 3)
-    high_coords: np.ndarray (N, 3)
-    atom_types : list[str]        элементы (C, N, O, ...)
-    res_types  : list[str]        остатки (ALA, VAL, ...)
+    low_coords    : np.ndarray (N, 3)
+    high_coords   : np.ndarray (N, 3)
+    atom_elements : list[str]   элементы (C, N, O, ...)
+    atom_names    : list[str]   имена атомов (CA, CB, ...)
+    res_names     : list[str]   названия остатков (ALA, VAL, ...)
+    res_seqs      : list[int]   номера остатков
+    chain_ids     : list[str]   идентификаторы цепей
+    icodes        : list[str]   insertion codes (обычно "")
     """
-    parser = PDBParser(QUIET=True)
-    low_s  = parser.get_structure("low",  low_path)
-    high_s = parser.get_structure("high", high_path)
+    low_s  = _make_parser(low_path).get_structure("low",  low_path)
+    high_s = _make_parser(high_path).get_structure("high", high_path)
 
-    # словарь: ключ -> Atom
-    def _build_map(struct: Structure) -> dict[tuple[str, int, str], Atom]:
-        return {
-            _atom_id_in_chain(at): at
-            for at in struct.get_atoms()
-            if at.get_parent().get_id()[0] == " "
-        }
+    # словарь: ключ -> Atom (только полипептидные остатки, hetflag == ' ')
+    def _build_map(struct: Structure) -> dict[tuple, Atom]:
+        out: dict[tuple, Atom] = {}
+        for at in struct.get_atoms():
+            res = at.get_parent()
+            if res.get_id()[0] != " ":
+                continue
+            key = _atom_id_in_chain(at)
+            # Если для одного atom.name есть несколько altloc, оставляем первый
+            # стабильный (обычно "A" или "").
+            if key not in out:
+                out[key] = at
+        return out
 
     low_map  = _build_map(low_s)
     high_map = _build_map(high_s)
 
-    # пересечение атомов
-    common_keys = sorted(low_map.keys() & high_map.keys())
+    # пересечение атомов. Сортируем по биологически-значимому порядку
+    # (chain_id, resseq, icode, atom_name, altloc) — но НЕ по resname,
+    # иначе атомы соседних остатков перемешаются.
+    # key layout: (chain_id, resname, resseq, icode, atom_name, altloc)
+    common = low_map.keys() & high_map.keys()
+    common_keys = sorted(
+        common,
+        key=lambda k: (k[0], k[2], k[3], k[4], k[5]),
+    )
 
     if not common_keys:
         raise ValueError("Нет общих атомов между low и high структурами.")
@@ -60,13 +102,18 @@ def align_structures(
     low_coords  = np.stack([low_map[k].coord  for k in common_keys], dtype=np.float32)
     high_coords = np.stack([high_map[k].coord for k in common_keys], dtype=np.float32)
     atom_elements = [low_map[k].element.strip().upper() for k in common_keys]
-    atom_names = [k[2].strip().upper() for k in common_keys]
-    res_names = [k[0].strip() for k in common_keys]
-    res_seqs = [k[1] for k in common_keys]
-    
+    atom_names = [k[4].strip().upper() for k in common_keys]
+    res_names = [k[1].strip() for k in common_keys]
+    res_seqs = [k[2] for k in common_keys]
+    chain_ids = [k[0] for k in common_keys]
+    icodes = [k[3] for k in common_keys]
+
     LOGGER.debug("Выравнено %d атомов", len(common_keys))
 
-    return low_coords, high_coords, atom_elements, atom_names, res_names, res_seqs
+    return (
+        low_coords, high_coords, atom_elements, atom_names,
+        res_names, res_seqs, chain_ids, icodes,
+    )
     
 
 def kabsch_superimpose(P: np.ndarray, Q: np.ndarray):

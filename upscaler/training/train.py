@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import os
+import random
 import logging
+import warnings
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
 
-from upscaler.data.dataset import CurriculumSampler
 from upscaler.config import CSV_FILE, DATA_FOLDER, DEVICE
 from upscaler.data.dataset import (
     ProteinUpscalingDataset,
+    BucketBatchSampler,
+    CurriculumSampler,
     collate_batch,
 )
 from upscaler.model.upscaler import ProteinUpscaler
@@ -19,7 +22,7 @@ from upscaler.utils.metrics import QualityMetrics
 from upscaler.training.pipeline import TrainingPipeline
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
 def get_optimizer(model: nn.Module, lr: float = 1e-4) -> torch.optim.Optimizer:
@@ -71,6 +74,42 @@ def load_checkpoint(
     return epoch, metric
 
 
+def split_indices_by_uniprot(
+    dataset: ProteinUpscalingDataset,
+    val_fraction: float = 0.2,
+    seed: int = 42,
+) -> tuple[list[int], list[int]]:
+    """Сплит по uniprot_id, чтобы избежать leakage между train/val.
+
+    Пары без uniprot_id попадают в train (fallback).
+    """
+    by_uid: dict[str, list[int]] = {}
+    no_uid: list[int] = []
+    for i in range(len(dataset)):
+        uid = dataset.uniprot_id_for_pair(i)
+        if uid is None:
+            no_uid.append(i)
+        else:
+            by_uid.setdefault(uid, []).append(i)
+
+    uids = sorted(by_uid.keys())
+    rng = random.Random(seed)
+    rng.shuffle(uids)
+    n_val = max(1, int(round(val_fraction * len(uids)))) if uids else 0
+    val_uids = set(uids[:n_val])
+
+    train_indices: list[int] = list(no_uid)
+    val_indices: list[int] = []
+    for uid, idxs in by_uid.items():
+        (val_indices if uid in val_uids else train_indices).extend(idxs)
+
+    train_indices.sort()
+    val_indices.sort()
+    if not val_indices and train_indices:
+        val_indices = [train_indices.pop()]
+    return train_indices, val_indices
+
+
 def build_dataloaders(
     dataset: ProteinUpscalingDataset,
     batch_size: int,
@@ -79,40 +118,46 @@ def build_dataloaders(
     num_workers: int = 4,
     use_curriculum: bool = False,
     pin_memory: bool | None = None,
+    val_fraction: float = 0.2,
+    seed: int = 42,
 ):
-    """
-    Build train/val DataLoaders. Uses BucketBatchSampler for train to reduce padding.
-    Returns (train_loader, val_loader).
+    """Build train/val DataLoaders.
+
+    Split идёт по ``uniprot_id``. Bucket-режим использует
+    ``BucketBatchSampler`` (есть shuffle между эпохами).
+
+    Returns
+    -------
+    (train_loader, val_loader, train_subset, val_subset)
+        В curriculum-режиме ``train_loader is None``: caller обязан
+        самостоятельно использовать ``CurriculumSampler`` на ``train_subset``.
     """
     if pin_memory is None:
-        pin_memory = True if device.type == "cuda" else False
+        pin_memory = device.type == "cuda"
 
-    total = len(dataset)
-    train_size = int(0.8 * total)
-    val_size = total - train_size
-    indices = list(range(total))
-    train_indices = indices[:train_size]
-    val_indices = indices[train_size:]
-
+    train_indices, val_indices = split_indices_by_uniprot(
+        dataset, val_fraction=val_fraction, seed=seed
+    )
     train_subset = Subset(dataset, train_indices)
     val_subset = Subset(dataset, val_indices)
 
     if use_curriculum:
         train_loader = None
     elif use_bucket:
-        lengths = [dataset.get_num_atoms(i) for i in train_indices]
-        pairs = list(zip(train_indices, lengths))
-        pairs.sort(key=lambda x: x[1])
-        batches = []
-        for i in range(0, len(pairs), batch_size):
-            batch = [p[0] for p in pairs[i : i + batch_size]]
-            batches.append(batch)
+        bucket_sampler = BucketBatchSampler(
+            dataset,
+            batch_size=batch_size,
+            num_buckets=20,
+            shuffle=True,
+            indices=train_indices,
+        )
         train_loader = DataLoader(
             dataset,
-            batch_sampler=batches,
+            batch_sampler=bucket_sampler,
             collate_fn=collate_batch,
             num_workers=num_workers,
             pin_memory=pin_memory,
+            persistent_workers=(num_workers > 0),
         )
     else:
         train_loader = DataLoader(
@@ -150,7 +195,7 @@ def train_model(
     use_amp: bool = True,
     use_bucket: bool = True,
     use_curriculum: bool = False,
-    prefilter_cache: str | None = 'prefilter_cache.txt',
+    prefilter_cache: str | None = None#'prefilter_cache.txt',
 ):
     """
     High-level training loop. Uses TrainingPipeline internally.
@@ -161,10 +206,12 @@ def train_model(
     logger.info("Loading dataset...")
     dataset = ProteinUpscalingDataset(csv_file, data_folder, prefilter_cache=prefilter_cache)
 
-    # build loaders
-    train_loader, val_loader, _, _ = build_dataloaders(
-        dataset, batch_size, device, use_bucket=use_bucket
+    # build loaders (split по uniprot_id внутри build_dataloaders)
+    train_loader, val_loader, train_subset, _ = build_dataloaders(
+        dataset, batch_size, device, use_bucket=use_bucket,
+        use_curriculum=use_curriculum,
     )
+    train_indices_set = set(train_subset.indices) if use_curriculum else set()
 
     # init model
     logger.info("Initializing model...")
@@ -215,6 +262,9 @@ def train_model(
             num_batches = 0
             batch_idx = 0
             for batch_indices in epoch_iterator:
+                batch_indices = [i for i in batch_indices if i in train_indices_set]
+                if not batch_indices:
+                    continue
                 batch_samples = [dataset[i] for i in batch_indices]
                 batch = collate_batch(batch_samples)
                 loss, metrics = pipeline.train_one_batch(batch)
@@ -222,15 +272,15 @@ def train_model(
                 for k in total_metrics.keys():
                     if k in metrics:
                         total_metrics[k] += float(metrics[k].cpu().item())
-                    else:
-                        total_metrics[k] += 0.0
                 num_batches += 1
 
                 if batch_idx % 10 == 0:
                     logger.info(f"Train Batch {batch_idx} — loss {loss.item():.4f}")
                 batch_idx += 1
             avg_loss = total_loss / num_batches if num_batches else 0.0
-            avg_metrics = {k: v / num_batches if num_batches else 0.0 for k, v in total_metrics.items()}
+            avg_metrics = {
+                k: (v / num_batches if num_batches else 0.0) for k, v in total_metrics.items()
+            }
             avg_metrics["loss"] = avg_loss
             train_metrics = avg_metrics
             logger.info(f"Train metrics: {train_metrics}")
@@ -266,6 +316,7 @@ def train_model(
 
 
 if __name__ == "__main__":
+    warnings.filterwarnings('ignore')
     train_model(
         csv_file=CSV_FILE,
         data_folder=DATA_FOLDER,
@@ -277,5 +328,5 @@ if __name__ == "__main__":
         resume_from_checkpoint=None,
         use_amp=True,
         use_bucket=True,
-        use_curriculum=True,
+        use_curriculum=False,
     )

@@ -127,17 +127,30 @@ class SE3PositionalEncoder(nn.Module):
             shared_weights=False
         )
 
-    def forward(self, coords):
+    def forward(self, coords, mask=None):
+        """``mask`` — bool-маска [B, N]. Если задана, паддинговые координаты
+        смещаются на 1e6 при построении kNN, чтобы они не попадали в
+        ближайшие соседи реальных атомов. Сами r_ij считаются из
+        исходных координат, так что для real→real рёбер ничего не меняется,
+        а padding→padding рёбра дают r_ij≈0 и потом маскируются в poolings."""
         # coords: [B, N, 3]
         B, N, _ = coords.shape
-        # build knn graph по батчу (возвращает индексы по B*N)
-        edge_index = build_knn_graph(coords, k=self.k)  # [2, E]
-        senders, receivers = edge_index  # 1D tensors length E
+        device = coords.device
+
+        if mask is not None:
+            far = coords.new_full((), 1e6)
+            kgraph_coords = torch.where(mask.unsqueeze(-1), coords, far)
+        else:
+            kgraph_coords = coords
+
+        edge_index = build_knn_graph(kgraph_coords, k=self.k)  # [2, E]
+        edge_index = edge_index.to(device)
+        senders, receivers = edge_index
 
         coords_flat = coords.view(-1, 3)
-        sender_coords = coords_flat[senders]      # [E, 3]
-        receiver_coords = coords_flat[receivers]  # [E, 3]
-        r_ij = sender_coords - receiver_coords    # [E, 3]
+        sender_coords = coords_flat[senders]
+        receiver_coords = coords_flat[receivers]
+        r_ij = sender_coords - receiver_coords
 
         distances = torch.norm(r_ij, dim=-1, keepdim=True)  # [E, 1]
         r_ij_normalized = r_ij / (distances + 1e-8)         # [E, 3]
@@ -171,7 +184,7 @@ class AtomTypeEmbedder(nn.Module):
         Returns:
             atom_feats: Tensor of shape [..., self.irreps_out.dim]
         """
-        return self.embedding(atom_types)
+        return self.embedding(atom_types.to(self.embedding.weight.device))
 
 class ResidueTypeEmbedder(nn.Module):
     def __init__(self, vocab_size=len(RESIDUE_TYPE_MAP), irreps_out="32x0e + 16x1e"):
@@ -187,7 +200,7 @@ class ResidueTypeEmbedder(nn.Module):
         Returns:
             res_feats: Tensor of shape [..., self.irreps_out.dim]
         """
-        return self.embedding(residue_types)
+        return self.embedding(residue_types.to(self.embedding.weight.device))
 
 class ProteinEncoder(nn.Module):
     def __init__(self):
@@ -198,16 +211,15 @@ class ProteinEncoder(nn.Module):
         self.d_out = self.position_encoder.irreps_out.dim + self.atom_embedder.irreps_out.dim + self.residue_embedder.irreps_out.dim
         self.irreps_out = self.position_encoder.irreps_out + self.atom_embedder.irreps_out + self.residue_embedder.irreps_out
 
-    def forward(self, coords, atom_types, residue_types):
+    def forward(self, coords, atom_types, residue_types, mask=None):
         """
         Args:
             coords: Tensor of shape [..., N, 3]
             atom_types: LongTensor of shape [..., N]
             residue_types: LongTensor of shape [..., N]
-        Returns:
-            node_features: Tensor of shape [..., N, d_out] (инвариантные признаки)
+            mask: optional bool mask [..., N] — паддинг для kNN.
         """
-        pos_feats = self.position_encoder(coords) 
+        pos_feats = self.position_encoder(coords, mask=mask)
         atom_feats = self.atom_embedder(atom_types)
         res_feats = self.residue_embedder(residue_types)
         node_features = torch.cat([pos_feats, atom_feats, res_feats], dim=-1)
@@ -223,10 +235,15 @@ def build_knn_graph(coords, k=8):
         edge_index: LongTensor of shape [2, E]
     """
     from torch_geometric.nn import knn_graph
+
     if coords.dim() == 2:
         coords = coords.unsqueeze(0)
     batch_size, num_nodes, _ = coords.shape
     coords_flat = coords.view(-1, 3)
     batch_indices = torch.arange(batch_size, device=coords.device).repeat_interleave(num_nodes)
-    edge_index = knn_graph(coords_flat, k=k, batch=batch_indices, loop=False)
+    coords_flat_cpu = coords_flat.detach().cpu()
+    batch_indices_cpu = batch_indices.detach().cpu()
+    edge_index = knn_graph(coords_flat_cpu, k=k, batch=batch_indices_cpu, loop=False)
+    edge_index = edge_index.long().to(coords.device)
+
     return edge_index

@@ -20,6 +20,14 @@ ATOM_TYPE_MAP = ProteinUpscalingDataset._build_map(
      'CL', 'BR', 'I', 'F']
 )
 
+# Карта имён атомов согласована с ProteinUpscalingDataset
+ATOM_NAME_MAP = ProteinUpscalingDataset._build_map(
+    ['N', 'CA', 'C', 'O', 'CB', 'CG', 'CG1', 'CG2', 'CD', 'CD1', 'CD2',
+     'CE', 'CE1', 'CE2', 'CE3', 'CZ', 'CZ2', 'CZ3', 'CH2', 'ND1', 'ND2',
+     'NE', 'NE1', 'NE2', 'NH1', 'NH2', 'NZ', 'OD1', 'OD2', 'OE1', 'OE2',
+     'OG', 'OG1', 'OH', 'SD', 'SE', 'SG']
+)
+
 # Создаем тензор радиусов Ван-дер-Ваальса
 vdw_radii_list = [0.0]  # PAD
 for atom_symbol, _ in sorted(ATOM_TYPE_MAP.items(), key=lambda item: item[1]):
@@ -33,9 +41,9 @@ VDW_RADII_TENSOR = torch.tensor(vdw_radii_list, dtype=torch.float32)
 
 class FAPELoss(nn.Module):
     """
-    Frame-Aligned Point Error (FAPE) Loss, как в AlphaFold2.
+    Frame-Aligned Point Error (FAPE) Loss.
     """
-    def __init__(self, clash_weight=0.05, physics_weight=0.3, clamp_dist=10.0):
+    def __init__(self, clash_weight=0.05, physics_weight=0.3, clamp_dist=30.0):
         super().__init__()
         self.clash_weight = clash_weight
         self.physics_weight = physics_weight
@@ -47,20 +55,31 @@ class FAPELoss(nn.Module):
     def forward(self, pred_data, true_data):
         """
         Args:
-            pred_data (dict): Словарь с предсказанными 'rots', 'trans', 'coords'
-            true_data (dict): Словарь с истинными 'rots', 'trans', 'coords', 'atom_types'
+            pred_data (dict): 'rots', 'trans', 'coords', 'mask', 'res_mask'
+            true_data (dict): 'rots', 'trans', 'coords', 'atom_types',
+                              'atom_names', 'res_map', 'res_chain'
         """
         fape_loss = self.compute_fape(
             (pred_data['rots'], pred_data['trans']),
             (true_data['rots'], true_data['trans']),
-            pred_data['coords'],
-            true_data['coords'],
             res_mask=pred_data.get('res_mask'),
-            mask=pred_data.get('mask'),
         )
 
-        clash_loss = self.clash_loss_fn(pred_data['coords'], true_data['atom_types'])
-        physics_loss = self.physics_loss_fn(pred_data['coords'], true_data['atom_types'])
+        clash_loss = self.clash_loss_fn(
+            pred_data['coords'],
+            true_data['atom_types'],
+            res_map=true_data.get('res_map'),
+            res_chain=true_data.get('res_chain'),
+            mask=pred_data.get('mask'),
+        )
+        physics_loss = self.physics_loss_fn(
+            pred_data['coords'],
+            true_data['atom_types'],
+            atom_names=true_data.get('atom_names'),
+            res_map=true_data.get('res_map'),
+            res_chain=true_data.get('res_chain'),
+            mask=pred_data.get('mask'),
+        )
 
         total_loss = fape_loss + \
                      self.clash_weight * clash_loss + \
@@ -75,112 +94,196 @@ class FAPELoss(nn.Module):
         
         return total_loss, metrics
 
-    def compute_fape(self, pred_frames, true_frames, pred_coords, true_coords, res_mask=None, mask=None, eps=1e-8):
-        # Распаковка фреймов
-        rots_pred, trans_pred = pred_frames
+    def compute_fape(self, pred_frames, true_frames, res_mask=None, eps=1e-8):
+        """CA-FAPE: ошибка предсказанных позиций CA-атомов (= translations
+        фреймов) в локальных системах координат каждого residue.
+
+        Тензор-память: ``[B, N_res, N_res, 3]`` вместо ``[B, N_res, N_atoms, 3]``.
+        Для N_atoms ≫ N_res это разница в десятки раз: на длинных белках
+        полная all-atom версия упирается в OOM.
+        """
+        rots_pred, trans_pred = pred_frames  # trans это CA-позиция
         rots_true, trans_true = true_frames
 
-        # Инвертируем фреймы
         inv_rots_pred, inv_trans_pred = invert_frames(rots_pred, trans_pred)
         inv_rots_true, inv_trans_true = invert_frames(rots_true, trans_true)
-        
-        # Переводим глобальные координаты всех атомов в локальные системы координат КАЖДОГО остатка
-        # Shape: [B, N_res, N_atoms, 3]
-        local_coords_pred = apply_frames(inv_rots_pred.unsqueeze(2), inv_trans_pred.unsqueeze(2), pred_coords.unsqueeze(1))
-        local_coords_true = apply_frames(inv_rots_true.unsqueeze(2), inv_trans_true.unsqueeze(2), true_coords.unsqueeze(1))
-        
-        # Считаем L2-расстояние
-        error_dist = torch.sqrt(torch.sum((local_coords_pred - local_coords_true) ** 2, dim=-1) + eps)
-        
-        # Ограничиваем расстояние
+
+        # local_coords[b, i, j] = inv_R_i @ (CA_j - t_i): CA остатка j в
+        # локальной системе остатка i.
+        local_coords_pred = apply_frames(
+            inv_rots_pred.unsqueeze(2),
+            inv_trans_pred.unsqueeze(2),
+            trans_pred.unsqueeze(1),
+        )
+        local_coords_true = apply_frames(
+            inv_rots_true.unsqueeze(2),
+            inv_trans_true.unsqueeze(2),
+            trans_true.unsqueeze(1),
+        )
+
+        error_dist = torch.sqrt(
+            torch.sum((local_coords_pred - local_coords_true) ** 2, dim=-1) + eps
+        )
         clamped_error = torch.clamp(error_dist, max=self.clamp_dist)
-        
-        # Применяем маски, если они есть
-        if mask is not None:
-             clamped_error = clamped_error * mask.unsqueeze(1)
+
+        # Маска валидных пар (residue_i, residue_j)
         if res_mask is not None:
-             clamped_error = clamped_error * res_mask.unsqueeze(2)
-        
-        # Усредняем
-        loss = torch.sum(clamped_error) / (torch.sum(mask) * torch.sum(res_mask) + eps)
-        
-        return loss
+            m = res_mask.to(dtype=clamped_error.dtype)
+            pair_mask = m.unsqueeze(2) * m.unsqueeze(1)
+        else:
+            pair_mask = torch.ones_like(clamped_error)
+
+        return torch.sum(clamped_error * pair_mask) / (torch.sum(pair_mask) + eps)
 
 
 class ClashLoss(nn.Module):
-    def forward(self, coords, atom_types, vdw_radii=VDW_RADII_TENSOR, eps=1e-8):
-        """Вычисляет штраф за стерические столкновения."""
-        # Получаем радиусы Ван-дер-Ваальса для каждого атома
+    """
+    Штраф за стерические столкновения.
+
+    Исключаем из учёта:
+      • атомы в одном остатке (внутри-residue связи);
+      • атомы соседних остатков (i, i+1) — содержат пептидную связь C–N;
+      • паддинг (по mask).
+    """
+
+    def forward(
+        self,
+        coords,
+        atom_types,
+        vdw_radii=VDW_RADII_TENSOR,
+        res_map=None,
+        res_chain=None,
+        mask=None,
+        eps=1e-8,
+    ):
         vdw_radii = vdw_radii.to(atom_types.device)
         radii = vdw_radii[atom_types]
-        
-        # Вычисляем все попарные расстояния
+
+        # Попарные расстояния и пороги
         distances = torch.cdist(coords, coords, p=2)
-        
-        # Вычисляем минимальные допустимые расстояния
         min_distances = radii.unsqueeze(-1) + radii.unsqueeze(-2)
-        
-        # Маска для столкновений
+
         clashes = (distances < min_distances) & (distances > eps)
-        
-        # Подсчитываем количество столкновений
-        num_clashes = torch.sum(clashes.float(), dim=(-1, -2)) / 2.0
-        
-        num_atoms = coords.shape[-2]
-        if num_atoms > 0:
-            normalized_clashes = num_clashes / num_atoms
+
+        # Исключаем "bonded" пары: |i-j|<=1 в ОДНОЙ цепи.
+        # На chain break (разные цепи) пара остаётся как clash-кандидат.
+        if res_map is not None:
+            diff_res = (res_map.unsqueeze(-1) - res_map.unsqueeze(-2)).abs()
+            same_chain = torch.ones_like(diff_res, dtype=torch.bool)
+            if res_chain is not None:
+                # chain per atom = res_chain.gather(res_map_clamped)
+                rmap_c = res_map.clamp(min=0)
+                chain_per_atom = torch.gather(res_chain, 1, rmap_c)
+                same_chain = (
+                    chain_per_atom.unsqueeze(-1) == chain_per_atom.unsqueeze(-2)
+                ) & (chain_per_atom.unsqueeze(-1) >= 0)
+            bonded = (diff_res <= 1) & same_chain
+            clashes = clashes & (~bonded)
+
+        # Маска паддинга
+        if mask is not None:
+            m = mask.to(dtype=torch.bool)
+            pair_mask = m.unsqueeze(-1) & m.unsqueeze(-2)
+            clashes = clashes & pair_mask
+            valid_atoms = m.float().sum(dim=-1)
         else:
-            normalized_clashes = torch.zeros_like(num_clashes)
-        
-        # Возвращаем среднее количество столкновений на пример в батче
+            valid_atoms = torch.full(
+                coords.shape[:-2], float(coords.shape[-2]),
+                device=coords.device, dtype=coords.dtype
+            )
+
+        num_clashes = torch.sum(clashes.float(), dim=(-1, -2)) / 2.0
+        valid_atoms = torch.clamp(valid_atoms, min=1.0)
+        normalized_clashes = num_clashes / valid_atoms
+
         return torch.mean(normalized_clashes)
 
 
 class PhysicsLoss(nn.Module):
-    def forward(self, coords, atom_types, backbone_elements={'C', 'N', 'O'}, eps=1e-8):
-        """
-        Вычисляет физико-химические ограничения.
-        В данном случае - штраф за нереалистичные длины пептидных связей (C-N).
-        """
-        c_type_idx = ATOM_TYPE_MAP['C']
-        n_type_idx = ATOM_TYPE_MAP['N']
-        
-        is_c = (atom_types == c_type_idx)
-        is_n = (atom_types == n_type_idx)
-        
-        # Вычисляем все расстояния между C и N атомами
-        c_coords = coords.unsqueeze(-2)
-        n_coords = coords.unsqueeze(-3)
-        cn_distances = torch.norm(c_coords - n_coords, dim=-1)
-        
-        # Создаем маску для пар C-N
-        c_mask = is_c.unsqueeze(-1)
-        n_mask = is_n.unsqueeze(-2)
-        cn_mask = c_mask & n_mask
-        
-        # Ожидаемая длина пептидной связи C-N ~ 1.33 Angstrom
-        expected_length = 1.33
-        # Допустимое отклонение
-        tolerance = 0.2
-        
-        # Вычисляем отклонение от ожидаемой длины
-        deviation = torch.abs(cn_distances - expected_length)
-        
-        # Штраф для пар, которые выходят за пределы допуска
-        penalty = F.relu(deviation - tolerance)
-        
-        # Применяем маску и усредняем
-        masked_penalty = penalty * cn_mask.float()
-        # Суммируем по всем парам и нормализуем
-        total_penalty = torch.sum(masked_penalty, dim=(-1, -2))
-        # Нормализуем по количеству пар C-N в каждом примере
-        num_cn_pairs = torch.sum(cn_mask.float(), dim=(-1, -2))
-        num_cn_pairs = torch.clamp(num_cn_pairs, min=1.0)
-        
-        avg_penalty_per_sample = total_penalty / num_cn_pairs
-        
-        # Возвращаем средний штраф по батчу
-        return torch.mean(avg_penalty_per_sample)
+    """
+    Штраф за отклонение длины пептидной связи C(i)–N(i+1) от ожидаемой ~1.33 Å.
+
+    В отличие от наивной all-pairs C–N версии, здесь учитываются ТОЛЬКО реальные
+    пептидные связи между остатком i и i+1, что требует atom_names и res_map.
+    """
+
+    def forward(
+        self,
+        coords,
+        atom_types,
+        atom_names=None,
+        res_map=None,
+        res_chain=None,
+        mask=None,
+        expected_length: float = 1.33,
+        tolerance: float = 0.2,
+        eps: float = 1e-8,
+    ):
+        # Без сведений об именах атомов / индексах остатков честно посчитать
+        # peptide-bond loss не получится → возвращаем 0.
+        if atom_names is None or res_map is None:
+            return coords.new_zeros(())
+
+        c_name_idx = ATOM_NAME_MAP['C']
+        n_name_idx = ATOM_NAME_MAP['N']
+
+        B, N = atom_names.shape
+
+        if mask is not None:
+            m = mask.to(dtype=torch.bool)
+        else:
+            m = torch.ones_like(atom_names, dtype=torch.bool)
+
+        is_bb_c = (atom_names == c_name_idx) & m
+        is_bb_n = (atom_names == n_name_idx) & m
+
+        penalties = []
+        for b in range(B):
+            c_idx = torch.nonzero(is_bb_c[b], as_tuple=False).flatten()
+            n_idx = torch.nonzero(is_bb_n[b], as_tuple=False).flatten()
+            if c_idx.numel() == 0 or n_idx.numel() == 0:
+                continue
+
+            c_res = res_map[b, c_idx]
+            n_res = res_map[b, n_idx]
+
+            n_lookup: dict[int, int] = {}
+            for ni in range(n_idx.numel()):
+                r = int(n_res[ni].item())
+                if r not in n_lookup:
+                    n_lookup[r] = int(n_idx[ni].item())
+
+            pairs_c, pairs_n = [], []
+            for ci in range(c_idx.numel()):
+                r = int(c_res[ci].item())
+                nxt = n_lookup.get(r + 1)
+                if nxt is None:
+                    continue
+                # Пропускаем границу цепей: если residue r и r+1 в разных
+                # цепях, это НЕ пептидная связь.
+                if res_chain is not None:
+                    chain_r = int(res_chain[b, r].item()) if 0 <= r < res_chain.shape[1] else -1
+                    chain_n = int(res_chain[b, r + 1].item()) if 0 <= r + 1 < res_chain.shape[1] else -1
+                    if chain_r != chain_n or chain_r < 0:
+                        continue
+                pairs_c.append(int(c_idx[ci].item()))
+                pairs_n.append(nxt)
+
+            if not pairs_c:
+                continue
+
+            c_xyz = coords[b, pairs_c]
+            n_xyz = coords[b, pairs_n]
+            dist = torch.norm(c_xyz - n_xyz, dim=-1)
+            deviation = torch.abs(dist - expected_length)
+            penalty = F.relu(deviation - tolerance)
+            penalty = torch.clamp(penalty, max=10.0)
+            penalties.append(penalty.mean())
+
+        if not penalties:
+            return coords.new_zeros(())
+
+        return torch.stack(penalties).mean()
 
 
 class LddtLoss(nn.Module):
