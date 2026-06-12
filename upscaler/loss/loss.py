@@ -155,44 +155,64 @@ class ClashLoss(nn.Module):
         res_chain=None,
         mask=None,
         eps=1e-8,
+        chunk_size: int = 1024,
     ):
+        """Считает clash-штраф чанками по строкам атомов.
+
+        Полная матрица ``[B, N, N]`` (cdist + несколько булевых масок) на
+        больших белках упирается в память. Чанкинг по первой атомной оси
+        держит пик на уровне ``[B, chunk_size, N]`` без изменения семантики:
+        каждая неупорядоченная пара по-прежнему учитывается дважды (строки
+        проходят по всем атомам), и в конце делим на 2.
+        """
         vdw_radii = vdw_radii.to(atom_types.device)
-        radii = vdw_radii[atom_types]
+        radii = vdw_radii[atom_types]                      # [B, N]
+        B, N = atom_types.shape
 
-        # Попарные расстояния и пороги
-        distances = torch.cdist(coords, coords, p=2)
-        min_distances = radii.unsqueeze(-1) + radii.unsqueeze(-2)
+        # chain-per-atom считаем один раз (для исключения bonded-пар).
+        chain_per_atom = None
+        if res_map is not None and res_chain is not None:
+            rmap_c = res_map.clamp(min=0)
+            chain_per_atom = torch.gather(res_chain, 1, rmap_c)   # [B, N]
 
-        clashes = (distances < min_distances) & (distances > eps)
-
-        # Исключаем "bonded" пары: |i-j|<=1 в ОДНОЙ цепи.
-        # На chain break (разные цепи) пара остаётся как clash-кандидат.
-        if res_map is not None:
-            diff_res = (res_map.unsqueeze(-1) - res_map.unsqueeze(-2)).abs()
-            same_chain = torch.ones_like(diff_res, dtype=torch.bool)
-            if res_chain is not None:
-                # chain per atom = res_chain.gather(res_map_clamped)
-                rmap_c = res_map.clamp(min=0)
-                chain_per_atom = torch.gather(res_chain, 1, rmap_c)
-                same_chain = (
-                    chain_per_atom.unsqueeze(-1) == chain_per_atom.unsqueeze(-2)
-                ) & (chain_per_atom.unsqueeze(-1) >= 0)
-            bonded = (diff_res <= 1) & same_chain
-            clashes = clashes & (~bonded)
-
-        # Маска паддинга
         if mask is not None:
             m = mask.to(dtype=torch.bool)
-            pair_mask = m.unsqueeze(-1) & m.unsqueeze(-2)
-            clashes = clashes & pair_mask
             valid_atoms = m.float().sum(dim=-1)
         else:
+            m = None
             valid_atoms = torch.full(
-                coords.shape[:-2], float(coords.shape[-2]),
-                device=coords.device, dtype=coords.dtype
+                (B,), float(N), device=coords.device, dtype=coords.dtype
             )
 
-        num_clashes = torch.sum(clashes.float(), dim=(-1, -2)) / 2.0
+        num_clashes = coords.new_zeros(B)
+        for c0 in range(0, N, chunk_size):
+            c1 = min(c0 + chunk_size, N)
+
+            dist = torch.cdist(coords[:, c0:c1], coords, p=2)        # [B, c, N]
+            min_distances = radii[:, c0:c1].unsqueeze(-1) + radii.unsqueeze(-2)
+            clashes = (dist < min_distances) & (dist > eps)
+
+            # Исключаем bonded-пары: |i-j|<=1 в одной цепи.
+            if res_map is not None:
+                diff_res = (
+                    res_map[:, c0:c1].unsqueeze(-1) - res_map.unsqueeze(-2)
+                ).abs()
+                same_chain = torch.ones_like(diff_res, dtype=torch.bool)
+                if chain_per_atom is not None:
+                    cpa_chunk = chain_per_atom[:, c0:c1]
+                    same_chain = (
+                        cpa_chunk.unsqueeze(-1) == chain_per_atom.unsqueeze(-2)
+                    ) & (cpa_chunk.unsqueeze(-1) >= 0)
+                bonded = (diff_res <= 1) & same_chain
+                clashes = clashes & (~bonded)
+
+            if m is not None:
+                pair_mask = m[:, c0:c1].unsqueeze(-1) & m.unsqueeze(-2)
+                clashes = clashes & pair_mask
+
+            num_clashes = num_clashes + clashes.float().sum(dim=(-1, -2))
+
+        num_clashes = num_clashes / 2.0
         valid_atoms = torch.clamp(valid_atoms, min=1.0)
         normalized_clashes = num_clashes / valid_atoms
 

@@ -43,12 +43,19 @@ from tqdm import tqdm  # noqa: E402
 
 from Bio.PDB import MMCIFParser, PDBParser  # noqa: E402
 
+import sys  # noqa: E402
+
+# Чтобы EDA могла переиспользовать тот же sequence-выравниватель, что и
+# обучающий пайплайн (а не дублировать логику), добавляем корень проекта в путь.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from upscaler.data.seq_align import ResidueInfo, match_chains, THREE_TO_ONE  # noqa: E402
+
 
 # ---------------------------------------------------------------------------
-Пути
+# Пути
 # ---------------------------------------------------------------------------
-CSV_PATH = "PATH/TO/pdb_df.csv"
-DATA_DIR = "PATH/TO/data"
+CSV_PATH = "/Users/lockiultra/Desktop/prog/upscaler_ITMO/old/mini_data/pdb_df.csv"
+DATA_DIR = "/Users/lockiultra/Desktop/prog/upscaler_ITMO/old/mini_data"
 RESULTS_DIR = "eda/results"
 CACHE_PATH = "eda/results/_parse_cache.pkl"
 # ---------------------------------------------------------------------------
@@ -164,6 +171,91 @@ def _common_xyz(atoms_a: np.ndarray, atoms_b: np.ndarray) -> tuple[np.ndarray, n
     return A.astype(np.float32), B.astype(np.float32)
 
 
+def _residues_from_atoms(atoms: np.ndarray) -> dict[str, list]:
+    """Группирует numpy-атомы в остатки по цепям для sequence-выравнивания.
+
+    Порядок остатков сохраняется как в файле (внутри цепи — по ходу
+    последовательности), что и требуется PairwiseAligner. ``ResidueInfo.atoms``
+    хранит xyz как numpy-вектор (а не Bio.Atom), чтобы не перепарсивать файлы.
+    """
+    chain_ids = atoms["chain_id"].tolist()
+    resseqs = atoms["resseq"].tolist()
+    icodes = atoms["icode"].tolist()
+    resnames = atoms["resname"].tolist()
+    anames = atoms["atom_name"].tolist()
+    xs = atoms["x"].tolist()
+    ys = atoms["y"].tolist()
+    zs = atoms["z"].tolist()
+
+    chains: dict[str, list] = {}
+    res_index: dict[tuple, int] = {}  # (chain, resseq, icode) -> позиция в chains[cid]
+    for i in range(len(atoms)):
+        cid = chain_ids[i]
+        rkey = (cid, resseqs[i], icodes[i])
+        if cid not in chains:
+            chains[cid] = []
+        idx = res_index.get(rkey)
+        if idx is None:
+            resname = resnames[i].strip()
+            chains[cid].append(ResidueInfo(
+                chain_id=cid, resname=resname,
+                resseq=int(resseqs[i]), icode=str(icodes[i]),
+                one_letter=THREE_TO_ONE.get(resname, "X"), atoms={},
+            ))
+            idx = len(chains[cid]) - 1
+            res_index[rkey] = idx
+        name = anames[i].strip()
+        ri = chains[cid][idx]
+        if name not in ri.atoms:
+            ri.atoms[name] = np.array((xs[i], ys[i], zs[i]), dtype=np.float32)
+    return chains
+
+
+def _common_xyz_seq(atoms_a: np.ndarray, atoms_b: np.ndarray,
+                    identity_min: float = 0.8):
+    """Общие атомы через sequence-выравнивание (как в upscaler.data.align).
+
+    Возвращает (A, B, n_common_res) — координаты совпавших атомов и число
+    совпавших остатков.
+    """
+    matched = match_chains(
+        _residues_from_atoms(atoms_a),
+        _residues_from_atoms(atoms_b),
+        identity_min=identity_min,
+    )
+    A, B = [], []
+    for ra, rb in matched:
+        for name, xyz_a in ra.atoms.items():
+            xyz_b = rb.atoms.get(name)
+            if xyz_b is None:
+                continue
+            A.append(xyz_a)
+            B.append(xyz_b)
+    if not A:
+        empty = np.empty((0, 3), dtype=np.float32)
+        return empty, empty, 0
+    return np.stack(A).astype(np.float32), np.stack(B).astype(np.float32), len(matched)
+
+
+def _match_atoms(atoms_good: np.ndarray, atoms_bad: np.ndarray, mode: str):
+    """Диспетчер: (A_good, B_bad, n_common_res) для режима 'seq' или 'exact'."""
+    if mode == "seq":
+        return _common_xyz_seq(atoms_good, atoms_bad)
+    # exact-match — историческое поведение (для сравнения «до/после»).
+    A, B = _common_xyz(atoms_good, atoms_bad)
+    res_keys_good = set(zip(
+        atoms_good["chain_id"].tolist(),
+        atoms_good["resseq"].tolist(),
+        atoms_good["icode"].tolist(),
+    ))
+    res_keys_bad = set(zip(
+        atoms_bad["chain_id"].tolist(),
+        atoms_bad["resseq"].tolist(),
+        atoms_bad["icode"].tolist(),
+    ))
+    return A, B, len(res_keys_good & res_keys_bad)
+
+
 def kabsch_rmsd(P: np.ndarray, Q: np.ndarray) -> float:
     """RMSD после оптимального наложения по методу Кабша."""
     n = P.shape[0]
@@ -262,27 +354,20 @@ def block_a(df: pd.DataFrame, data_dir: str, workers: int, results_dir: Path
 
 def _pair_validity_one(args):
     (atoms_good, atoms_bad, good_pdb, bad_pdb, uid,
-     good_res, bad_res, good_method, bad_method) = args
+     good_res, bad_res, good_method, bad_method, align_mode) = args
 
-    A, B = _common_xyz(atoms_good, atoms_bad)
+    A, B, n_common_res = _match_atoms(atoms_good, atoms_bad, align_mode)
     n_common = int(A.shape[0])
     rmsd = kabsch_rmsd(A, B) if n_common >= 4 else float("nan")
 
-    res_keys_good = set(zip(
-        atoms_good["chain_id"].tolist(),
-        atoms_good["resseq"].tolist(),
-        atoms_good["icode"].tolist(),
-    ))
-    res_keys_bad = set(zip(
-        atoms_bad["chain_id"].tolist(),
-        atoms_bad["resseq"].tolist(),
-        atoms_bad["icode"].tolist(),
-    ))
-    n_common_res = len(res_keys_good & res_keys_bad)
-
     n_atoms_good = int(len(atoms_good))
     n_atoms_bad = int(len(atoms_bad))
+    # coverage     — относительно БОЛЬШЕЙ структуры (историческая формула);
+    # coverage_min — относительно МЕНЬШЕЙ (совпадает с фильтром обучения и
+    #                SeqAlignment.coverage). Для domain-vs-complex именно
+    #                coverage_min показывает реальную долю совмещённого.
     coverage = n_common / max(n_atoms_good, n_atoms_bad, 1)
+    coverage_min = n_common / max(min(n_atoms_good, n_atoms_bad), 1)
 
     chains_good = set(atoms_good["chain_id"].tolist())
     chains_bad = set(atoms_bad["chain_id"].tolist())
@@ -294,15 +379,17 @@ def _pair_validity_one(args):
         "good_method": good_method, "bad_method": bad_method,
         "n_atoms_good": n_atoms_good, "n_atoms_bad": n_atoms_bad,
         "n_common_atoms": n_common, "n_common_residues": n_common_res,
-        "coverage": coverage, "kabsch_rmsd_initial": rmsd,
+        "coverage": coverage, "coverage_min": coverage_min,
+        "kabsch_rmsd_initial": rmsd,
         "n_chains_good": len(chains_good), "n_chains_bad": len(chains_bad),
         "chain_overlap": len(chains_good & chains_bad),
     }
 
 
-def block_b(df: pd.DataFrame, parsed: dict, results_dir: Path, workers: int
+def block_b(df: pd.DataFrame, parsed: dict, results_dir: Path, workers: int,
+            align_mode: str = "seq"
             ) -> pd.DataFrame:
-    LOG.info("Block B: pair-level validity...")
+    LOG.info("Block B: pair-level validity (align=%s)...", align_mode)
     pair_args = []
     for uid, group in df.groupby("uniprot_id"):
         good = group[group["class"] == "good"]
@@ -317,7 +404,7 @@ def block_b(df: pd.DataFrame, parsed: dict, results_dir: Path, workers: int
                     parsed[g["pdb"]]["atoms"], parsed[b["pdb"]]["atoms"],
                     g["pdb"], b["pdb"], uid,
                     float(g["resolution"]), float(b["resolution"]),
-                    str(g["method"]), str(b["method"]),
+                    str(g["method"]), str(b["method"]), align_mode,
                 ))
 
     if not pair_args:
@@ -338,9 +425,11 @@ def block_b(df: pd.DataFrame, parsed: dict, results_dir: Path, workers: int
     out.to_csv(results_dir / "block_b_pairs.csv", index=False)
 
     fig, axes = plt.subplots(2, 2, figsize=(12, 8))
-    out["coverage"].hist(bins=40, ax=axes[0, 0], color="tab:blue")
+    out["coverage_min"].hist(bins=40, ax=axes[0, 0], color="tab:blue")
     axes[0, 0].axvline(0.6, color="red", linestyle="--", label="0.6")
-    axes[0, 0].set_title("Coverage = common_atoms / max(n_a, n_b)")
+    axes[0, 0].set_title(
+        f"Coverage (= common / min(n_a, n_b)), align={align_mode}"
+    )
     axes[0, 0].legend()
 
     out["kabsch_rmsd_initial"].hist(bins=40, ax=axes[0, 1], color="tab:orange")
@@ -360,14 +449,17 @@ def block_b(df: pd.DataFrame, parsed: dict, results_dir: Path, workers: int
     plt.close(fig)
 
     summary = {
+        "align_mode": align_mode,
         "n_pairs": int(len(out)),
         "low_coverage_<0.6": int((out["coverage"] < 0.6).sum()),
         "low_coverage_<0.3": int((out["coverage"] < 0.3).sum()),
+        "low_coverage_min_<0.6": int((out["coverage_min"] < 0.6).sum()),
         "high_rmsd_>10A": int((out["kabsch_rmsd_initial"] > 10).sum()),
         "high_rmsd_>5A": int((out["kabsch_rmsd_initial"] > 5).sum()),
         "no_chain_overlap": int((out["chain_overlap"] == 0).sum()),
         "rmsd": out["kabsch_rmsd_initial"].describe().to_dict(),
         "coverage": out["coverage"].describe().to_dict(),
+        "coverage_min": out["coverage_min"].describe().to_dict(),
     }
     with open(results_dir / "block_b_summary.json", "w") as f:
         json.dump(summary, f, indent=2, default=str)
@@ -384,16 +476,17 @@ def block_b(df: pd.DataFrame, parsed: dict, results_dir: Path, workers: int
 # ---------------------------------------------------------------------------
 
 def _good_good_one(args):
-    a_atoms, b_atoms = args
-    A, B = _common_xyz(a_atoms, b_atoms)
+    a_atoms, b_atoms, align_mode = args
+    A, B, _ = _match_atoms(a_atoms, b_atoms, align_mode)
     if A.shape[0] < 4:
         return float("nan"), int(A.shape[0])
     return kabsch_rmsd(A, B), int(A.shape[0])
 
 
-def block_c(df: pd.DataFrame, parsed: dict, results_dir: Path, workers: int
+def block_c(df: pd.DataFrame, parsed: dict, results_dir: Path, workers: int,
+            align_mode: str = "seq"
             ) -> pd.DataFrame:
-    LOG.info("Block C: target ambiguity (good-good RMSD)...")
+    LOG.info("Block C: target ambiguity (good-good RMSD, align=%s)...", align_mode)
     pair_args = []
     pair_meta = []
     for uid, group in df.groupby("uniprot_id"):
@@ -404,7 +497,7 @@ def block_c(df: pd.DataFrame, parsed: dict, results_dir: Path, workers: int
         if len(goods) < 2:
             continue
         for a, b in combinations(goods, 2):
-            pair_args.append((parsed[a]["atoms"], parsed[b]["atoms"]))
+            pair_args.append((parsed[a]["atoms"], parsed[b]["atoms"], align_mode))
             pair_meta.append((uid, a, b))
 
     if not pair_args:
@@ -644,6 +737,12 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--blocks", default="ABCDE",
                         help="Подмножество блоков для запуска, например 'BCE'")
+    parser.add_argument(
+        "--align", choices=["seq", "exact"], default="seq",
+        help="Способ сопоставления атомов пар: 'seq' — sequence-выравнивание "
+             "(как в обучении), 'exact' — старый exact-match (для сравнения "
+             "«до/после»). Default: seq",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -692,13 +791,13 @@ def main():
 
     pair_df = pd.DataFrame()
     if "B" in args.blocks:
-        pair_df = block_b(df, parsed, results_dir, args.workers)
+        pair_df = block_b(df, parsed, results_dir, args.workers, align_mode=args.align)
     elif (results_dir / "block_b_pairs.csv").exists():
         pair_df = pd.read_csv(results_dir / "block_b_pairs.csv")
         LOG.info("Block B: re-using cached %d pairs", len(pair_df))
 
     if "C" in args.blocks:
-        block_c(df, parsed, results_dir, args.workers)
+        block_c(df, parsed, results_dir, args.workers, align_mode=args.align)
 
     if "D" in args.blocks:
         block_d(pair_df, results_dir, args.val_fraction, args.seed)

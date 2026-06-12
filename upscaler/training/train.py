@@ -9,7 +9,15 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
 
-from upscaler.config import CSV_FILE, DATA_FOLDER, DEVICE
+from upscaler.config import (
+    CSV_FILE,
+    DATA_FOLDER,
+    DEVICE,
+    COVERAGE_MIN,
+    PAIR_RMSD_MAX,
+    SEQ_IDENTITY_MIN,
+    MAX_ATOMS,
+)
 from upscaler.data.dataset import (
     ProteinUpscalingDataset,
     BucketBatchSampler,
@@ -195,7 +203,7 @@ def train_model(
     use_amp: bool = True,
     use_bucket: bool = True,
     use_curriculum: bool = False,
-    prefilter_cache: str | None = None#'prefilter_cache.txt',
+    prefilter_cache: str | None = "prefilter_cache.txt",
 ):
     """
     High-level training loop. Uses TrainingPipeline internally.
@@ -204,7 +212,14 @@ def train_model(
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     logger.info("Loading dataset...")
-    dataset = ProteinUpscalingDataset(csv_file, data_folder, prefilter_cache=prefilter_cache)
+    dataset = ProteinUpscalingDataset(
+        csv_file, data_folder,
+        prefilter_cache=prefilter_cache,
+        coverage_min=COVERAGE_MIN,
+        rmsd_max=PAIR_RMSD_MAX,
+        seq_identity_min=SEQ_IDENTITY_MIN,
+        max_atoms=MAX_ATOMS,
+    )
 
     # build loaders (split по uniprot_id внутри build_dataloaders)
     train_loader, val_loader, train_subset, _ = build_dataloaders(

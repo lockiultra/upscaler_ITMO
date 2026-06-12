@@ -13,7 +13,11 @@ from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset, Sampler
 from tqdm import tqdm
 
-from upscaler.data.align import align_structures, kabsch_superimpose
+from upscaler.data.align import (
+    align_structures,
+    align_structures_stats,
+    kabsch_superimpose,
+)
 from upscaler.model.geometric import frames_from_bb_coords
 
 
@@ -93,6 +97,9 @@ class ProteinUpscalingDataset(Dataset):
         resolution_bad: float = 3.5,
         prefilter_cache: str | None = None,
         max_atoms: int | None = 3000,
+        coverage_min: float = 0.6,
+        rmsd_max: float = 15.0,
+        seq_identity_min: float = 0.8,
     ) -> None:
         self.data_folder = Path(data_folder)
         self.atom_type_map = self._build_map(
@@ -116,13 +123,22 @@ class ProteinUpscalingDataset(Dataset):
 
         self.prefilter_cache = Path(prefilter_cache) if prefilter_cache else None
         self.max_atoms = max_atoms
+        self.coverage_min = coverage_min
+        self.rmsd_max = rmsd_max
+        self.seq_identity_min = seq_identity_min
 
         self.good_pair_indices: list[int] = []
         self._lengths_by_idx: dict[int, int] = {}
         self._rmsd_by_idx: dict[int, float] = {}
+        self._coverage_by_idx: dict[int, float] = {}
 
         self.good_pair_indices = self._load_or_create_good_indices()
-        logger.info(f"Dataset initialized with {len(self.good_pair_indices)} good pairs out of {len(self.all_pairs)} total pairs.")
+        logger.info(
+            f"Dataset initialized with {len(self.good_pair_indices)} good pairs "
+            f"out of {len(self.all_pairs)} total pairs "
+            f"(coverage>={self.coverage_min}, rmsd<={self.rmsd_max}, "
+            f"max_atoms={self.max_atoms})."
+        )
 
     @staticmethod
     def _build_map(items: list[str]) -> dict[str, int]:
@@ -165,28 +181,60 @@ class ProteinUpscalingDataset(Dataset):
         tried_paths = [str(self.data_folder / f"{pdb_id}{s}") for s in possible_suffixes]
         raise FileNotFoundError(f"Structure file for {pdb_id} not found. Tried: {tried_paths}")
 
-    def _is_pair_alignable(self, idx: int) -> tuple[bool, int, float]:
+    def _pair_stats(self, idx: int) -> tuple[bool, int, float, float]:
+        """Считает статистику пары: (parsed_ok, n_atoms, rmsd, coverage).
+
+        ``parsed_ok`` — удалось ли распарсить и сопоставить хоть какие-то
+        атомы (n_atoms > 0). Пороги фильтрации тут НЕ применяются — это делает
+        :meth:`_passes_thresholds`, чтобы менять пороги без перепарсинга
+        (кэш хранит сырую статистику).
+        """
         try:
             good_row, bad_row = self.all_pairs[idx]
             good_path = self._find_structure_file(good_row['pdb'])
             bad_path = self._find_structure_file(bad_row['pdb'])
-            low_coords, high_coords, *_ = align_structures(str(bad_path), str(good_path))
-            if low_coords.shape[0] == 0:
-                return False, 0, float('inf')
-            _, rmsd, _, _ = kabsch_superimpose(low_coords, high_coords)
-            return True, int(low_coords.shape[0]), float(rmsd)
+            n_atoms, rmsd, coverage = align_structures_stats(
+                str(bad_path), str(good_path), identity_min=self.seq_identity_min
+            )
+            if n_atoms == 0:
+                return False, 0, float('inf'), 0.0
+            return True, int(n_atoms), float(rmsd), float(coverage)
         except (FileNotFoundError, ValueError) as e:
-            logger.debug(f"Pair {idx} is not alignable: {e}")
-            return False, 0, float('inf')
+            logger.debug(f"Pair {idx} could not be aligned: {e}")
+            return False, 0, float('inf'), 0.0
         except Exception as e:
             logger.warning(f"Unexpected error checking pair {idx}: {e}")
-            return False, 0, float('inf')
+            return False, 0, float('inf'), 0.0
+
+    def _passes_thresholds(self, idx: int) -> bool:
+        """Прошла ли пара пороги качества (coverage / rmsd / max_atoms)."""
+        n_atoms = self._lengths_by_idx.get(idx, 0)
+        rmsd = self._rmsd_by_idx.get(idx, float('inf'))
+        coverage = self._coverage_by_idx.get(idx, 0.0)
+        if n_atoms <= 0:
+            return False
+        if self.max_atoms is not None and n_atoms > self.max_atoms:
+            return False
+        if coverage < self.coverage_min:
+            return False
+        if rmsd > self.rmsd_max:
+            return False
+        return True
+
+    def _record_stats(self, idx: int, n_atoms: int, rmsd: float, coverage: float) -> None:
+        self._lengths_by_idx[idx] = int(n_atoms)
+        self._rmsd_by_idx[idx] = float(rmsd)
+        self._coverage_by_idx[idx] = float(coverage)
 
     def _load_or_create_good_indices(self) -> list[int]:
+        """Загружает/считает сырую статистику всех распарсиваемых пар и
+        применяет пороги. Кэш хранит статистику (idx,length,rmsd,coverage),
+        поэтому смена порогов не требует повторного парсинга структур.
+        """
+        loaded_from_cache = False
         if self.prefilter_cache and self.prefilter_cache.exists():
-            logger.info(f"Loading good pair indices from cache: {self.prefilter_cache}")
+            logger.info(f"Loading pair stats from cache: {self.prefilter_cache}")
             try:
-                indices = []
                 with open(self.prefilter_cache, 'r') as f:
                     for line in f:
                         line = line.strip()
@@ -196,46 +244,44 @@ class ProteinUpscalingDataset(Dataset):
                         if not parts:
                             continue
                         idx = int(parts[0])
-                        indices.append(idx)
-                        if len(parts) > 1:
-                            try:
-                                length = int(parts[1])
-                                self._lengths_by_idx[idx] = length
-                            except Exception:
-                                pass
-                        if len(parts) > 2:
-                            try:
-                                rmsd = float(parts[2])
-                                self._rmsd_by_idx[idx] = rmsd
-                            except Exception:
-                                pass
-                logger.info(f"Loaded {len(indices)} indices from cache.")
-                return indices
+                        length = int(parts[1]) if len(parts) > 1 else 0
+                        rmsd = float(parts[2]) if len(parts) > 2 else float('inf')
+                        # Старый кэш (3 поля) coverage не содержит → 1.0 (не
+                        # отсекаем по покрытию, чтобы не ломать прежние кэши).
+                        coverage = float(parts[3]) if len(parts) > 3 else 1.0
+                        self._record_stats(idx, length, rmsd, coverage)
+                loaded_from_cache = True
+                logger.info(f"Loaded stats for {len(self._lengths_by_idx)} pairs from cache.")
             except Exception as e:
                 logger.error(f"Failed to load cache, regenerating: {e}")
+                self._lengths_by_idx.clear()
+                self._rmsd_by_idx.clear()
+                self._coverage_by_idx.clear()
 
-        logger.info("Generating list of good pair indices...")
-        good_indices: list[int] = []
-        total_pairs = len(self.all_pairs)
+        if not loaded_from_cache:
+            logger.info("Computing pair stats (sequence alignment)...")
+            total_pairs = len(self.all_pairs)
+            for i in tqdm(range(total_pairs)):
+                ok, n_atoms, rmsd, coverage = self._pair_stats(i)
+                if ok:
+                    self._record_stats(i, n_atoms, rmsd, coverage)
 
-        for i in tqdm(range(total_pairs)):
-            ok, length, rmsd = self._is_pair_alignable(i)
-            if ok:
-                good_indices.append(i)
-                self._lengths_by_idx[i] = int(length)
-                self._rmsd_by_idx[i] = float(rmsd)
+            if self.prefilter_cache:
+                logger.info(f"Saving pair stats to cache: {self.prefilter_cache}")
+                try:
+                    with open(self.prefilter_cache, 'w') as f:
+                        for idx in sorted(self._lengths_by_idx.keys()):
+                            length = self._lengths_by_idx[idx]
+                            rmsd = self._rmsd_by_idx.get(idx, float('inf'))
+                            coverage = self._coverage_by_idx.get(idx, 0.0)
+                            f.write(f"{idx},{length},{rmsd:.4f},{coverage:.4f}\n")
+                except Exception as e:
+                    logger.error(f"Failed to save cache: {e}")
 
-        if self.prefilter_cache:
-            logger.info(f"Saving good pair indices to cache: {self.prefilter_cache}")
-            try:
-                with open(self.prefilter_cache, 'w') as f:
-                    for idx in good_indices:
-                        length = self._lengths_by_idx.get(idx, 0)
-                        rmsd = self._rmsd_by_idx.get(idx, float('inf'))
-                        f.write(f"{idx},{length},{rmsd:.4f}\n")
-            except Exception as e:
-                logger.error(f"Failed to save cache: {e}")
-
+        good_indices = [
+            idx for idx in sorted(self._lengths_by_idx.keys())
+            if self._passes_thresholds(idx)
+        ]
         return good_indices
 
     def __len__(self) -> int:
@@ -271,7 +317,10 @@ class ProteinUpscalingDataset(Dataset):
                     low_coords, high_coords,
                     atom_elements, atom_names, res_names, res_seqs,
                     chain_ids, icodes,
-                ) = align_structures(str(bad_path), str(good_path))
+                ) = align_structures(
+                    str(bad_path), str(good_path),
+                    identity_min=self.seq_identity_min,
+                )
             except ValueError as e:
                 logger.error(f"Alignment failed for pair {actual_idx} ({bad_row['pdb']}, {good_row['pdb']}): {e}")
                 raise e
