@@ -46,24 +46,29 @@ def apply_frames(rots, trans, coords):
     return rotated_coords + trans
 
 
-def rots_from_vec(vec, eps=1e-8):
-    """Создает матрицу вращения из вектора по формуле Родрига.
-
-    Матрица K строится из самого вектора, без нормализации оси. Коэффициенты
-    через sinc сохраняют ненулевую производную вращения при vec=0 — именно
-    с этого значения начинает обучение FrameUpdateHead.
+def rots_from_vec(vec, eps=1e-4):
     """
-    theta = torch.norm(vec, dim=-1, keepdim=True)
-    zero = torch.zeros_like(vec[..., 0])
-    row0 = torch.stack([zero,          -vec[..., 2],  vec[..., 1]], dim=-1)
-    row1 = torch.stack([ vec[..., 2],   zero,        -vec[..., 0]], dim=-1)
-    row2 = torch.stack([-vec[..., 1],   vec[..., 0],  zero       ], dim=-1)
-    K = torch.stack([row0, row1, row2], dim=-2)  # [..., 3, 3]
+    Создает матрицу вращения из вектора в алгебре Ли so(3) по формуле Родрига.
+    """
 
-    theta = theta.unsqueeze(-1)  # [..., 1, 1]
-    eye = torch.eye(3, device=vec.device, dtype=vec.dtype).expand_as(K)
-    sin_over_theta = torch.sinc(theta / torch.pi)
-    one_minus_cos_over_theta_sq = 0.5 * torch.sinc(theta / (2 * torch.pi)) ** 2
-    return eye + sin_over_theta * K + one_minus_cos_over_theta_sq * torch.einsum(
-        '...ij,...jk->...ik', K, K
-    )
+    theta = torch.linalg.norm(vec, dim=-1, keepdim=True)  # [..., 1]
+
+    K = torch.zeros(*vec.shape[:-1], 3, 3, device=vec.device, dtype=vec.dtype)
+    K[..., 0, 1] = -vec[..., 2]
+    K[..., 0, 2] = vec[..., 1]
+    K[..., 1, 0] = vec[..., 2]
+    K[..., 1, 2] = -vec[..., 0]
+    K[..., 2, 0] = -vec[..., 1]
+    K[..., 2, 1] = vec[..., 0]
+
+    theta_sq = (theta ** 2).unsqueeze(-1)  # [..., 1, 1]
+    theta_exp = theta.unsqueeze(-1)        # [..., 1, 1]
+
+    small = theta_exp < eps
+    theta_safe = torch.where(small, torch.ones_like(theta_exp), theta_exp)
+
+    c1 = torch.where(small, 1.0 - theta_sq / 6.0, torch.sin(theta_safe) / theta_safe)
+    c2 = torch.where(small, 0.5 - theta_sq / 24.0, (1.0 - torch.cos(theta_safe)) / (theta_safe ** 2))
+
+    eye = torch.eye(3, device=vec.device, dtype=vec.dtype)
+    return eye + c1 * K + c2 * torch.einsum('...ij,...jk->...ik', K, K)

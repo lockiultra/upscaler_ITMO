@@ -13,7 +13,7 @@ from upscaler.model.encoders import build_knn_graph
 class SE3EquivariantLayer(MessagePassing):
     """SE(3)-эквивариантный слой на основе e3nn и MessagePassing."""
     def __init__(self, irreps_input='64x0e + 32x1e + 16x2e', irreps_output='64x0e + 32x1e + 16x2e', irreps_edge_attr="1x0e + 1x1e", **kwargs):
-        kwargs.setdefault('aggr', 'add')
+        kwargs.setdefault('aggr', 'mean')
         super().__init__(**kwargs)
         
         self.irreps_input = o3.Irreps(irreps_input)
@@ -210,10 +210,13 @@ class CoordinatePredictor(nn.Module):
 
 class FrameUpdateHead(nn.Module):
     """Предсказывает обновления фреймов (вращение и сдвиг)."""
-    def __init__(self, d_model=256):
+    def __init__(self, d_model=256, max_trans_step=1.0, max_rot_step=0.5):
         super().__init__()
         # 6 выходов: 3 для вектора вращения, 3 для вектора сдвига
+        self.norm = nn.LayerNorm(d_model)
         self.predictor = nn.Linear(d_model, 6)
+        self.max_trans_step = max_trans_step
+        self.max_rot_step = max_rot_step
         nn.init.zeros_(self.predictor.weight)
         nn.init.zeros_(self.predictor.bias)
 
@@ -226,8 +229,10 @@ class FrameUpdateHead(nn.Module):
                    rot_vec: [..., N_res, 3]
                    trans_vec: [..., N_res, 3]
         """
-        updates = self.predictor(node_feats)
+        updates = self.predictor(self.norm(node_feats))
         rot_vec, trans_vec = torch.split(updates, 3, dim=-1)
+        rot_vec = torch.tanh(rot_vec) * self.max_rot_step
+        trans_vec = torch.tanh(trans_vec) * self.max_trans_step
         return rot_vec, trans_vec
 
 # /mnt/tank/scratch/dlibin/upscaler_ITMO/checkpoints/checkpoint_epoch_9.pt
