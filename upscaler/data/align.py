@@ -149,7 +149,9 @@ def kabsch_superimpose(P: np.ndarray, Q: np.ndarray):
 
     d = np.sign(np.linalg.det(np.dot(V, Wt)))
     D = np.diag([1.0, 1.0, d])
-    R = np.dot(V, np.dot(D, Wt))
+    # C = Q_centered.T @ P_centered; для векторов-столбцов Q -> P
+    # требуется W @ D @ V.T (обратный порядок даёт обратное вращение).
+    R = Wt.T @ D @ V.T
     t = Pc - R.dot(Qc)
 
     Q_aligned = (R.dot(Q.T)).T + t
