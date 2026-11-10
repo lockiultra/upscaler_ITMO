@@ -1,8 +1,10 @@
 # Основные зависимости
 torch==2.2.2
 torch_cluster==1.6.3
+torch-scatter==2.1.2
 torch-geometric==2.6.1
 e3nn==0.5.6
+invariant-point-attention==0.2.2
 biopython==1.85
 pandas==2.3.0
 numpy==1.26.4
