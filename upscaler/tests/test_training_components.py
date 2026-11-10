@@ -1,13 +1,11 @@
 """Тесты тренировочного пайплайна под новый dict-API."""
+import unittest
 import sys
 import os
-sys.path.append(
-    os.path.dirname(
-        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    )
-)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import torch
+from upscaler.tests import ComponentTestCase
 from torch.utils.data import Dataset, DataLoader, Subset
 
 from upscaler.training.pipeline import TrainingPipeline
@@ -44,6 +42,7 @@ def _make_dummy_sample(n_res: int = 4):
         'residue_types': torch.randint(1, 10, (n_atoms,)),
         'atom_names': atom_names,
         'res_map': torch.arange(n_res).repeat_interleave(3),
+        'res_chain': torch.zeros(n_res, dtype=torch.long),
         'length': torch.tensor(n_atoms, dtype=torch.long),
         'num_residues': torch.tensor(n_res, dtype=torch.long),
     }
@@ -59,6 +58,9 @@ class DummyDataset(Dataset):
 
     def __getitem__(self, idx: int):
         return _make_dummy_sample(self.n_res)
+
+    def uniprot_id_for_pair(self, idx: int):
+        return f'P{idx}'
 
 
 def _collate(batch):
@@ -78,54 +80,53 @@ def _collate(batch):
     return out
 
 
-def test_training_pipeline_train_and_validate():
-    print("Testing TrainingPipeline train_epoch + validate...")
-    device = torch.device('cpu')
-    model = ProteinUpscaler(num_iterations=1)
-    loss_fn = ProteinUpscalingLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-    metrics_calc = QualityMetrics(device=device)
 
-    pipeline = TrainingPipeline(
-        model=model,
-        loss_fn=loss_fn,
-        optimizer=optimizer,
-        device=device,
-        clip_grad_norm=1.0,
-        metrics_calculator=metrics_calc,
-        use_amp=False,
-    )
+class TrainingComponentsTest(ComponentTestCase):
+    def test_training_pipeline_train_and_validate(self):
+        print("Testing TrainingPipeline train_epoch + validate...")
+        device = torch.device('cpu')
+        model = ProteinUpscaler(num_iterations=1)
+        loss_fn = ProteinUpscalingLoss()
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+        metrics_calc = QualityMetrics(device=device)
 
-    dataset = DummyDataset(size=2, n_res=4)
-    loader = DataLoader(dataset, batch_size=1, collate_fn=_collate)
+        pipeline = TrainingPipeline(
+            model=model,
+            loss_fn=loss_fn,
+            optimizer=optimizer,
+            device=device,
+            clip_grad_norm=1.0,
+            metrics_calculator=metrics_calc,
+            use_amp=False,
+        )
 
-    train_metrics = pipeline.train_epoch(loader)
-    assert isinstance(train_metrics, dict)
-    assert 'loss' in train_metrics and train_metrics['loss'] >= 0
-    print("train_epoch OK")
+        dataset = DummyDataset(size=2, n_res=4)
+        loader = DataLoader(dataset, batch_size=1, collate_fn=_collate)
 
-    val_metrics = pipeline.validate(loader)
-    assert set(val_metrics.keys()) == {'val_rmsd', 'val_lddt', 'val_clash'}
-    for v in val_metrics.values():
-        assert isinstance(v, float)
-        assert v >= 0
-    print("validate OK")
+        train_metrics = pipeline.train_epoch(loader)
+        assert isinstance(train_metrics, dict)
+        assert 'loss' in train_metrics and train_metrics['loss'] >= 0
+        print("train_epoch OK")
 
+        val_metrics = pipeline.validate(loader)
+        assert set(val_metrics.keys()) == {'val_rmsd', 'val_lddt', 'val_clash'}
+        for v in val_metrics.values():
+            assert isinstance(v, float)
+            assert v >= 0
+        print("validate OK")
 
-def test_protein_fold_cross_validation():
-    print("Testing ProteinFoldCrossValidation...")
-    dataset = DummyDataset(size=20)
-    cv = ProteinFoldCrossValidation(dataset, num_folds=5, seed=42)
-    folds = cv.create_folds()
-    assert len(folds) == 5
-    for train_subset, val_subset in folds:
-        assert isinstance(train_subset, Subset)
-        assert isinstance(val_subset, Subset)
-        assert set(train_subset.indices).isdisjoint(val_subset.indices)
-    print("Cross-validation test passed.")
+    def test_protein_fold_cross_validation(self):
+        print("Testing ProteinFoldCrossValidation...")
+        dataset = DummyDataset(size=20)
+        cv = ProteinFoldCrossValidation(dataset, num_folds=5, seed=42)
+        folds = cv.create_folds()
+        assert len(folds) == 5
+        for train_subset, val_subset in folds:
+            assert isinstance(train_subset, Subset)
+            assert isinstance(val_subset, Subset)
+            assert set(train_subset.indices).isdisjoint(val_subset.indices)
+        print("Cross-validation test passed.")
 
 
 if __name__ == "__main__":
-    test_training_pipeline_train_and_validate()
-    test_protein_fold_cross_validation()
-    print("All training component tests passed!")
+    unittest.main()
