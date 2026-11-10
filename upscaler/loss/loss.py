@@ -43,7 +43,7 @@ class FAPELoss(nn.Module):
     """
     Frame-Aligned Point Error (FAPE) Loss.
     """
-    def __init__(self, clash_weight=0.05, physics_weight=0.3, clamp_dist=30.0):
+    def __init__(self, clash_weight=0.05, physics_weight=0.0, clamp_dist=30.0):
         super().__init__()
         self.clash_weight = clash_weight
         self.physics_weight = physics_weight
@@ -72,14 +72,18 @@ class FAPELoss(nn.Module):
             res_chain=true_data.get('res_chain'),
             mask=pred_data.get('mask'),
         )
-        physics_loss = self.physics_loss_fn(
-            pred_data['coords'],
-            true_data['atom_types'],
-            atom_names=true_data.get('atom_names'),
-            res_map=true_data.get('res_map'),
-            res_chain=true_data.get('res_chain'),
-            mask=pred_data.get('mask'),
-        )
+        # P0-4: для первого запуска физический компонент отключён. При нулевом
+        # весе пропускаем и расчёт, чтобы он не влиял на loss через 0 * NaN.
+        physics_loss = pred_data['coords'].new_zeros(())
+        if self.physics_weight != 0.0:
+            physics_loss = self.physics_loss_fn(
+                pred_data['coords'],
+                true_data['atom_types'],
+                atom_names=true_data.get('atom_names'),
+                res_map=true_data.get('res_map'),
+                res_chain=true_data.get('res_chain'),
+                mask=pred_data.get('mask'),
+            )
 
         total_loss = fape_loss + \
                      self.clash_weight * clash_loss + \
@@ -190,7 +194,8 @@ class ClashLoss(nn.Module):
 
             dist = torch.cdist(coords[:, c0:c1], coords, p=2)        # [B, c, N]
             min_distances = radii[:, c0:c1].unsqueeze(-1) + radii.unsqueeze(-2)
-            clashes = (dist < min_distances) & (dist > eps)
+            overlap = F.relu(min_distances - dist)
+            valid_pairs = dist > eps
 
             # Исключаем bonded-пары: |i-j|<=1 в одной цепи.
             if res_map is not None:
@@ -204,13 +209,13 @@ class ClashLoss(nn.Module):
                         cpa_chunk.unsqueeze(-1) == chain_per_atom.unsqueeze(-2)
                     ) & (cpa_chunk.unsqueeze(-1) >= 0)
                 bonded = (diff_res <= 1) & same_chain
-                clashes = clashes & (~bonded)
+                valid_pairs = valid_pairs & (~bonded)
 
             if m is not None:
                 pair_mask = m[:, c0:c1].unsqueeze(-1) & m.unsqueeze(-2)
-                clashes = clashes & pair_mask
+                valid_pairs = valid_pairs & pair_mask
 
-            num_clashes = num_clashes + clashes.float().sum(dim=(-1, -2))
+            num_clashes = num_clashes + (overlap * valid_pairs).sum(dim=(-1, -2))
 
         num_clashes = num_clashes / 2.0
         valid_atoms = torch.clamp(valid_atoms, min=1.0)
