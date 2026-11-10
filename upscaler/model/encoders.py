@@ -119,31 +119,22 @@ class SE3PositionalEncoder(nn.Module):
         self.number_of_basis = number_of_basis
         self.k = k
 
-        input_irreps = o3.Irreps("1x1o")
+        self.sh = o3.SphericalHarmonics(
+            "1x0e + 1x1e + 1x2e", normalize=True, normalization="component"
+        )
         self.tp = FullyConnectedTensorProduct(
-            input_irreps,
+            self.sh.irreps_out,
             f"{number_of_basis}x0e",
             self.irreps_out,
-            shared_weights=False
         )
 
     def forward(self, coords, mask=None):
-        """``mask`` — bool-маска [B, N]. Если задана, паддинговые координаты
-        смещаются на 1e6 при построении kNN, чтобы они не попадали в
-        ближайшие соседи реальных атомов. Сами r_ij считаются из
-        исходных координат, так что для real→real рёбер ничего не меняется,
-        а padding→padding рёбра дают r_ij≈0 и потом маскируются в poolings."""
+        """``mask`` — bool-маска [B, N]; паддинг исключается из kNN-графа."""
         # coords: [B, N, 3]
         B, N, _ = coords.shape
         device = coords.device
 
-        if mask is not None:
-            far = coords.new_full((), 1e6)
-            kgraph_coords = torch.where(mask.unsqueeze(-1), coords, far)
-        else:
-            kgraph_coords = coords
-
-        edge_index = build_knn_graph(kgraph_coords, k=self.k)  # [2, E]
+        edge_index = build_knn_graph(coords, k=self.k, mask=mask)  # [2, E]
         edge_index = edge_index.to(device)
         senders, receivers = edge_index
 
@@ -159,8 +150,8 @@ class SE3PositionalEncoder(nn.Module):
         cutoff = (distances / self.max_radius).clamp(0.0, 1.0)  # [E,1]
         radial_basis = gaussian_soft_one_hot(cutoff, 0.0, 1.0, self.number_of_basis)  # [E, K]
 
-        # FullyConnectedTensorProduct ожидает (vector, scalar-basis)
-        invariant_features = self.tp(r_ij_normalized, radial_basis)  # [E, out_dim]
+        angular_features = self.sh(r_ij_normalized)
+        invariant_features = self.tp(angular_features, radial_basis)  # [E, out_dim]
 
         num_total = B * N
         aggregated = scatter_mean(invariant_features, receivers, dim=0, dim_size=num_total)
@@ -225,12 +216,13 @@ class ProteinEncoder(nn.Module):
         node_features = torch.cat([pos_feats, atom_feats, res_feats], dim=-1)
         return node_features
 
-def build_knn_graph(coords, k=8):
+def build_knn_graph(coords, k=8, mask=None):
     """
     Строит граф k-ближайших соседей.
     Args:
         coords: Tensor of shape [N, 3] or [B, N, 3]
         k: int, количество соседей
+        mask: bool Tensor [B, N] (или [N]), валидные узлы
     Returns:
         edge_index: LongTensor of shape [2, E]
     """
@@ -238,12 +230,24 @@ def build_knn_graph(coords, k=8):
 
     if coords.dim() == 2:
         coords = coords.unsqueeze(0)
+        if mask is not None:
+            mask = mask.unsqueeze(0)
     batch_size, num_nodes, _ = coords.shape
-    coords_flat = coords.view(-1, 3)
-    batch_indices = torch.arange(batch_size, device=coords.device).repeat_interleave(num_nodes)
-    coords_flat_cpu = coords_flat.detach().cpu()
-    batch_indices_cpu = batch_indices.detach().cpu()
-    edge_index = knn_graph(coords_flat_cpu, k=k, batch=batch_indices_cpu, loop=False)
-    edge_index = edge_index.long().to(coords.device)
-
-    return edge_index
+    coords_cpu = coords.detach().cpu()
+    mask_cpu = mask.detach().to(device='cpu', dtype=torch.bool) if mask is not None else None
+    edges = []
+    for batch_idx in range(batch_size):
+        valid_indices = (
+            torch.nonzero(mask_cpu[batch_idx], as_tuple=False).flatten()
+            if mask_cpu is not None else torch.arange(num_nodes)
+        )
+        # k не может превышать число остальных реальных узлов. Сдвиг
+        # паддинга далеко от структуры этого не гарантирует при N_valid <= k.
+        neighbors = min(k, valid_indices.numel() - 1)
+        if neighbors <= 0:
+            continue
+        local_edges = knn_graph(coords_cpu[batch_idx, valid_indices], k=neighbors, loop=False)
+        edges.append(valid_indices[local_edges.long()] + batch_idx * num_nodes)
+    if not edges:
+        return torch.empty((2, 0), dtype=torch.long, device=coords.device)
+    return torch.cat(edges, dim=1).to(coords.device)
