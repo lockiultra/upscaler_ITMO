@@ -167,10 +167,11 @@ class ProteinUpscalingDataset(Dataset):
         """Возвращает uniprot_id пары по dataset-индексу (после prefilter)."""
         actual_idx = self.good_pair_indices[dataset_index]
         good_row, bad_row = self.all_pairs[actual_idx]
-        uid = good_row.get('uniprot_id', None)
-        if uid is None:
-            uid = bad_row.get('uniprot_id', None)
-        return None if uid is None else str(uid)
+        for row in (good_row, bad_row):
+            uid = row.get('uniprot_id', None)
+            if uid is not None and not pd.isna(uid) and str(uid).strip():
+                return str(uid).strip()
+        return None
 
     def _find_structure_file(self, pdb_id: str) -> Path:
         possible_suffixes = ['.pdb', '.cif']
@@ -292,68 +293,54 @@ class ProteinUpscalingDataset(Dataset):
         return int(self._lengths_by_idx.get(actual_idx, 0))
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-        # Итеративный обход вместо скрытой рекурсии: безопаснее по стэку
-        # и проще диагностируется при поломанных образцах.
+        # Индекс всегда обозначает ту же пару: подмена следующим образцом
+        # может перенести белок из validation в training или наоборот.
         n = len(self)
-        if n == 0:
-            raise IndexError("ProteinUpscalingDataset is empty")
+        if idx < 0:
+            idx += n
+        if not 0 <= idx < n:
+            raise IndexError('ProteinUpscalingDataset index out of range')
 
-        visited = 0
-        cur = idx % n
-        last_error: Exception | None = None
-        while visited < n:
-            actual_idx = self.good_pair_indices[cur]
-            good_row, bad_row = self.all_pairs[actual_idx]
+        actual_idx = self.good_pair_indices[idx]
+        good_row, bad_row = self.all_pairs[actual_idx]
 
-            try:
-                good_path = self._find_structure_file(good_row['pdb'])
-                bad_path = self._find_structure_file(bad_row['pdb'])
-            except FileNotFoundError as e:
-                logger.error(f"File not found for pair {actual_idx}: {e}")
-                raise e
+        try:
+            good_path = self._find_structure_file(good_row['pdb'])
+            bad_path = self._find_structure_file(bad_row['pdb'])
+        except FileNotFoundError as e:
+            logger.error(f"File not found for pair {actual_idx}: {e}")
+            raise e
 
-            try:
-                (
-                    low_coords, high_coords,
-                    atom_elements, atom_names, res_names, res_seqs,
-                    chain_ids, icodes,
-                ) = align_structures(
-                    str(bad_path), str(good_path),
-                    identity_min=self.seq_identity_min,
-                )
-            except ValueError as e:
-                logger.error(f"Alignment failed for pair {actual_idx} ({bad_row['pdb']}, {good_row['pdb']}): {e}")
-                raise e
-
-            if low_coords.shape[0] > 0:
-                aligned_high_coords, _, _, _ = kabsch_superimpose(low_coords, high_coords)
-                high_coords = aligned_high_coords
-
-            bb_coords_bad, res_map_bad, atom_mask_bad, res_chain_bad = _get_residue_data(
-                low_coords, atom_names, res_names, res_seqs,
-                chain_ids=chain_ids, icodes=icodes,
+        try:
+            (
+                low_coords, high_coords,
+                atom_elements, atom_names, res_names, res_seqs,
+                chain_ids, icodes,
+            ) = align_structures(
+                str(bad_path), str(good_path),
+                identity_min=self.seq_identity_min,
             )
-            bb_coords_good, res_map_good, atom_mask_good, _ = _get_residue_data(
-                high_coords, atom_names, res_names, res_seqs,
-                chain_ids=chain_ids, icodes=icodes,
-            )
+        except ValueError as e:
+            logger.error(f"Alignment failed for pair {actual_idx} ({bad_row['pdb']}, {good_row['pdb']}): {e}")
+            raise e
 
-            if bb_coords_bad is None or bb_coords_good is None:
-                last_error = ValueError(f"Empty backbone data for pair {actual_idx}")
-                logger.warning(f"Skipping pair {actual_idx}: empty backbone data")
-            elif not torch.equal(atom_mask_bad, atom_mask_good):
-                last_error = ValueError(f"Atom masks mismatch for pair {actual_idx}")
-                logger.warning(f"Skipping pair {actual_idx}: atom masks mismatch")
-            else:
-                break  # успешный образец
+        if low_coords.shape[0] > 0:
+            aligned_high_coords, _, _, _ = kabsch_superimpose(low_coords, high_coords)
+            high_coords = aligned_high_coords
 
-            visited += 1
-            cur = (cur + 1) % n
-        else:
-            raise RuntimeError(
-                f"No valid samples found after scanning entire dataset (n={n}). "
-                f"Last error: {last_error}"
-            )
+        bb_coords_bad, res_map_bad, atom_mask_bad, res_chain_bad = _get_residue_data(
+            low_coords, atom_names, res_names, res_seqs,
+            chain_ids=chain_ids, icodes=icodes,
+        )
+        bb_coords_good, res_map_good, atom_mask_good, _ = _get_residue_data(
+            high_coords, atom_names, res_names, res_seqs,
+            chain_ids=chain_ids, icodes=icodes,
+        )
+
+        if bb_coords_bad is None or bb_coords_good is None:
+            raise ValueError(f'Empty backbone data for pair {actual_idx}')
+        if not torch.equal(atom_mask_bad, atom_mask_good):
+            raise ValueError(f'Atom masks mismatch for pair {actual_idx}')
 
         rots_bad, trans_bad = frames_from_bb_coords(
             bb_coords_bad[:,0], bb_coords_bad[:,1], bb_coords_bad[:,2]
