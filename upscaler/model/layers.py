@@ -12,7 +12,7 @@ from upscaler.model.encoders import build_knn_graph
 
 class SE3EquivariantLayer(MessagePassing):
     """SE(3)-эквивариантный слой на основе e3nn и MessagePassing."""
-    def __init__(self, irreps_input='64x0e + 32x1e + 16x2e', irreps_output='64x0e + 32x1e + 16x2e', irreps_edge_attr="1x1o", **kwargs):
+    def __init__(self, irreps_input='64x0e + 32x1e + 16x2e', irreps_output='64x0e + 32x1e + 16x2e', irreps_edge_attr="1x0e + 1x1e", **kwargs):
         kwargs.setdefault('aggr', 'add')
         super().__init__(**kwargs)
         
@@ -61,7 +61,7 @@ class LocalRefinementBlock(nn.Module):
         self.k = k
         self.irreps_input = o3.Irreps(irreps_model)
         self.irreps_output = self.irreps_input
-        self.irreps_edge_attr = o3.Irreps("1x1o")
+        self.irreps_edge_attr = o3.Irreps("1x0e + 1x1e")
         
         self.equivariant_layer = SE3EquivariantLayer(
             self.irreps_input,
@@ -80,25 +80,20 @@ class LocalRefinementBlock(nn.Module):
         batch_size, num_nodes, d_model = node_feats.shape
         d_model = self.irreps_input.dim
 
-        # Строим локальный граф. Паддинговые координаты сдвигаем «в бесконечность»,
-        # чтобы они не оказались среди ближайших соседей реальных узлов.
+        # Строим локальный граф только по реальным узлам.
         device = coords.device
-        if mask is not None:
-            far = coords.new_full((), 1e6)
-            kgraph_coords = torch.where(mask.unsqueeze(-1), coords, far)
-        else:
-            kgraph_coords = coords
-        edge_index = build_knn_graph(kgraph_coords, k=self.k)
+        edge_index = build_knn_graph(coords, k=self.k, mask=mask)
         edge_index = edge_index.to(device)
 
-        # Преобразуем координаты в векторные атрибуты ребер. edge_attr
-        # считаем по исходным coords (не shifted), чтобы значения остались
-        # геометрически корректными для real→real рёбер.
+        # Преобразуем координаты в скалярные и векторные атрибуты рёбер.
         senders, receivers = edge_index
         sender_coords = coords.view(-1, 3)[senders]
         receiver_coords = coords.view(-1, 3)[receivers]
         edge_vectors = sender_coords - receiver_coords
-        edge_attr = edge_vectors
+        edge_attr = torch.cat([
+            torch.ones_like(edge_vectors[..., :1]),
+            F.normalize(edge_vectors, dim=-1),
+        ], dim=-1)
         
         # Преобразуем в формат PyG
         node_feats_flat = node_feats.view(-1, d_model)
