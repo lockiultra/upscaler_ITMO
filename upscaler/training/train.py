@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import random
 import logging
 import warnings
 
@@ -28,6 +27,7 @@ from upscaler.model.upscaler import ProteinUpscaler
 from upscaler.loss.loss import ProteinUpscalingLoss
 from upscaler.utils.metrics import QualityMetrics
 from upscaler.training.pipeline import TrainingPipeline
+from upscaler.training.split import split_indices_by_uniprot
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -82,42 +82,6 @@ def load_checkpoint(
     return epoch, metric
 
 
-def split_indices_by_uniprot(
-    dataset: ProteinUpscalingDataset,
-    val_fraction: float = 0.2,
-    seed: int = 42,
-) -> tuple[list[int], list[int]]:
-    """Сплит по uniprot_id, чтобы избежать leakage между train/val.
-
-    Пары без uniprot_id попадают в train (fallback).
-    """
-    by_uid: dict[str, list[int]] = {}
-    no_uid: list[int] = []
-    for i in range(len(dataset)):
-        uid = dataset.uniprot_id_for_pair(i)
-        if uid is None:
-            no_uid.append(i)
-        else:
-            by_uid.setdefault(uid, []).append(i)
-
-    uids = sorted(by_uid.keys())
-    rng = random.Random(seed)
-    rng.shuffle(uids)
-    n_val = max(1, int(round(val_fraction * len(uids)))) if uids else 0
-    val_uids = set(uids[:n_val])
-
-    train_indices: list[int] = list(no_uid)
-    val_indices: list[int] = []
-    for uid, idxs in by_uid.items():
-        (val_indices if uid in val_uids else train_indices).extend(idxs)
-
-    train_indices.sort()
-    val_indices.sort()
-    if not val_indices and train_indices:
-        val_indices = [train_indices.pop()]
-    return train_indices, val_indices
-
-
 def build_dataloaders(
     dataset: ProteinUpscalingDataset,
     batch_size: int,
@@ -146,6 +110,8 @@ def build_dataloaders(
     train_indices, val_indices = split_indices_by_uniprot(
         dataset, val_fraction=val_fraction, seed=seed
     )
+    if not train_indices or not val_indices:
+        raise ValueError('Train/validation split requires at least two distinct uniprot_id values')
     train_subset = Subset(dataset, train_indices)
     val_subset = Subset(dataset, val_indices)
 
@@ -268,8 +234,7 @@ def train_model(
 
             total_loss = 0.0
             total_metrics = {
-                "coord_rmsd": 0.0,
-                "lddt": 0.0,
+                "fape": 0.0,
                 "clash": 0.0,
                 "physics": 0.0,
                 "total": 0.0,
