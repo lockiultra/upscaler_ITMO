@@ -49,21 +49,21 @@ def apply_frames(rots, trans, coords):
 def rots_from_vec(vec, eps=1e-8):
     """Создает матрицу вращения из вектора по формуле Родрига.
 
-    Реализация через ``torch.stack`` — необходимо, чтобы матрица K оставалась
-    дифференцируемой по ``vec``. In-place присвоения по индексам в новый
-    ``torch.zeros``-тензор обрывают autograd-граф.
+    Матрица K строится из самого вектора, без нормализации оси. Коэффициенты
+    через sinc сохраняют ненулевую производную вращения при vec=0 — именно
+    с этого значения начинает обучение FrameUpdateHead.
     """
     theta = torch.norm(vec, dim=-1, keepdim=True)
-    v = vec / (theta + eps)
-
-    zero = torch.zeros_like(v[..., 0])
-    row0 = torch.stack([zero,        -v[..., 2],  v[..., 1]], dim=-1)
-    row1 = torch.stack([ v[..., 2],   zero,      -v[..., 0]], dim=-1)
-    row2 = torch.stack([-v[..., 1],   v[..., 0],  zero      ], dim=-1)
+    zero = torch.zeros_like(vec[..., 0])
+    row0 = torch.stack([zero,          -vec[..., 2],  vec[..., 1]], dim=-1)
+    row1 = torch.stack([ vec[..., 2],   zero,        -vec[..., 0]], dim=-1)
+    row2 = torch.stack([-vec[..., 1],   vec[..., 0],  zero       ], dim=-1)
     K = torch.stack([row0, row1, row2], dim=-2)  # [..., 3, 3]
 
     theta = theta.unsqueeze(-1)  # [..., 1, 1]
     eye = torch.eye(3, device=vec.device, dtype=vec.dtype).expand_as(K)
-    return eye + torch.sin(theta) * K + (1 - torch.cos(theta)) * torch.einsum(
+    sin_over_theta = torch.sinc(theta / torch.pi)
+    one_minus_cos_over_theta_sq = 0.5 * torch.sinc(theta / (2 * torch.pi)) ** 2
+    return eye + sin_over_theta * K + one_minus_cos_over_theta_sq * torch.einsum(
         '...ij,...jk->...ik', K, K
     )
