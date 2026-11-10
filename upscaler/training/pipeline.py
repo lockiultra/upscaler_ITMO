@@ -75,8 +75,7 @@ class TrainingPipeline:
 
         total_loss = 0.0
         total_metrics = {
-            "coord_rmsd": 0.0,
-            "lddt": 0.0,
+            "fape": 0.0,
             "clash": 0.0,
             "physics": 0.0,
             "total": 0.0,
